@@ -345,9 +345,9 @@ def run_one_fold(
 
     hp = HyperParameters(
         n_steps=cfg.n_steps,
-        input_embed_size=128,
-        n_layers=2,
-        n_heads=4,
+        input_embed_size=256,
+        n_layers=4,
+        n_heads=8,
     )
 
     model = HTv2ChordModel(
@@ -362,14 +362,7 @@ def run_one_fold(
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-    )
-
+    
     best_val_loss = float("inf")
     best_state_dict = None
     epochs_without_improvement = 0
@@ -406,7 +399,6 @@ def run_one_fold(
             change_loss_weight=0,
         )
 
-        scheduler.step(val_metrics["loss"])
         current_lr = optimizer.param_groups[0]["lr"]
         epoch_progress.set_postfix(
             lr=f"{current_lr:.2e}",

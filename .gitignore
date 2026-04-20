@@ -1,3 +1,4 @@
 .venv/
 __pycache__/
 chord_data_1217/
+.DS_Store

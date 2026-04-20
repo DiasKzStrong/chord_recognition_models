@@ -13,6 +13,7 @@ def get_args():
     parser.add_argument('--patience', type=int, default=10,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
     parser.add_argument('--grad_clip', type=float, default=None)
+    parser.add_argument('--experiment_name',type=str, help="Experiment name that you currently running")
     return parser.parse_args()
 
 if __name__ == "__main__":

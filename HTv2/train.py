@@ -380,7 +380,7 @@ def run_one_fold(
         unit="epoch",
     )
     
-    ckpt_dir = os.path.join(root_dir, "checkpoints")
+    ckpt_dir = os.path.join(root_dir, "checkpoints", args.experiment_name)
     os.makedirs(ckpt_dir, exist_ok=True)
     fold_name = os.path.splitext(os.path.basename(fold_json_path))[0]
     best_ckpt_path = os.path.join(ckpt_dir, f"{fold_name}_best.pt")

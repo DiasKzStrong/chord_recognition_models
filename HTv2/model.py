@@ -499,6 +499,8 @@ class HTv2(nn.Module):
         source_mask: torch.Tensor,   # [B, T]
         target_mask: torch.Tensor,   # [B, T]
         slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
     ):
         hp = self.hp
         B, T, _ = x.shape
@@ -541,6 +543,17 @@ class HTv2(nn.Module):
         chord_change_prediction = chord_change_prediction.clone()
         chord_change_prediction[:, 0] = 0
 
+        regionalization_changes = chord_change_prediction
+        if (
+            self.training
+            and chord_change_targets is not None
+            and boundary_teacher_forcing_prob > 0.0
+        ):
+            use_teacher = torch.rand((), device=x.device) < boundary_teacher_forcing_prob
+            if bool(use_teacher.item()):
+                regionalization_changes = chord_change_targets.long().clone()
+                regionalization_changes[:, 0] = 0
+
         # Decoder input
         dec_input_embed = self.dec_input_proj(x)
         dec_input_embed = self.dropout(dec_input_embed)
@@ -553,7 +566,7 @@ class HTv2(nn.Module):
         # Regionalization
         dec_input_embed_reg, block_ids, num_blocks = chord_block_compression(
             dec_input_embed,
-            chord_change_prediction,
+            regionalization_changes,
             compression="mean",
         )
         dec_input_embed_reg = decode_compressed_sequences(dec_input_embed_reg, block_ids)
@@ -598,6 +611,7 @@ class HTv2(nn.Module):
             "self_attn_maps": self_attn_map_list,
             "attn_maps": attn_map_list,
             "chord_change_prediction": chord_change_prediction,
+            "regionalization_changes": regionalization_changes,
         }
 
 
@@ -632,12 +646,16 @@ class HTv2ChordModel(nn.Module):
         source_mask: torch.Tensor,
         target_mask: torch.Tensor,
         slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         out = self.backbone(
             x=x,
             source_mask=source_mask,
             target_mask=target_mask,
             slope=slope,
+            chord_change_targets=chord_change_targets,
+            boundary_teacher_forcing_prob=boundary_teacher_forcing_prob,
         )
 
         chord_logits = self.chord_classifier(out["dec_output"])  # [B, T, n_chords]

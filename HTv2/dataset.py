@@ -2,6 +2,7 @@ import os
 import json
 from dataclasses import dataclass
 from typing import Dict, List
+import random
 
 import numpy as np
 import torch
@@ -45,6 +46,16 @@ class ProcessedChordConfig:
     stride: int = 64
     batch_size: int = 8
     num_workers: int = 0
+    augment_train: bool = False
+    noise_std: float = 0.01
+    gain_min: float = 0.9
+    gain_max: float = 1.1
+    time_mask_width: int = 8
+    freq_mask_width: int = 12
+    pitch_shift_bins: int = 0
+    use_signal_decay: bool = False
+    signal_decay_min: float = 0.4
+    signal_decay_max: float = 0.9
 
 
 class ChordVocab:
@@ -91,6 +102,8 @@ def chord_label_to_quality(label: str | None) -> str:
         return "N"
 
     if ":" not in label:
+        if _looks_like_root_label(label):
+            return "maj"
         return "Others"
 
     _, quality = label.split(":", 1)
@@ -113,6 +126,14 @@ def chord_label_to_quality(label: str | None) -> str:
         return "min7"
 
     return "Others"
+
+
+def _looks_like_root_label(label: str) -> bool:
+    roots = {
+        "C", "C#", "DB", "D", "D#", "EB", "E", "F",
+        "F#", "GB", "G", "G#", "AB", "A", "A#", "BB", "B",
+    }
+    return label.strip().upper() in roots
 
 def load_fold_split(fold_json_path: str):
     with open(fold_json_path, "r", encoding="utf-8") as f:
@@ -211,16 +232,68 @@ def slice_into_windows(
 
 
 class ProcessedChordDataset(Dataset):
-    def __init__(self, items: List[Dict]):
+    def __init__(self, items: List[Dict], augment: bool = False, cfg: ProcessedChordConfig | None = None):
         self.items = items
+        self.augment = augment
+        self.cfg = cfg
 
     def __len__(self):
         return len(self.items)
 
+    def _augment_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.cfg is None:
+            return x
+
+        if self.cfg.use_signal_decay:
+            x = self._apply_signal_decay(x)
+
+        if self.cfg.noise_std > 0:
+            x = x + torch.randn_like(x) * self.cfg.noise_std
+
+        if self.cfg.gain_min > 0 and self.cfg.gain_max > 0:
+            gain = random.uniform(self.cfg.gain_min, self.cfg.gain_max)
+            x = x * gain
+
+        T, F = x.shape
+
+        if self.cfg.time_mask_width > 0 and T > 1:
+            width = random.randint(0, min(self.cfg.time_mask_width, T))
+            if width > 0:
+                start = random.randint(0, T - width)
+                x[start:start + width, :] = 0.0
+
+        if self.cfg.freq_mask_width > 0 and F > 1:
+            width = random.randint(0, min(self.cfg.freq_mask_width, F))
+            if width > 0:
+                start = random.randint(0, F - width)
+                x[:, start:start + width] = 0.0
+
+        if self.cfg.pitch_shift_bins > 0 and F > 1:
+            shift = random.randint(-self.cfg.pitch_shift_bins, self.cfg.pitch_shift_bins)
+            if shift != 0:
+                x = torch.roll(x, shifts=shift, dims=1)
+
+        return x
+
+    def _apply_signal_decay(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[0]
+        if T <= 1:
+            return x
+
+        min_gain = min(self.cfg.signal_decay_min, self.cfg.signal_decay_max)
+        max_gain = max(self.cfg.signal_decay_min, self.cfg.signal_decay_max)
+        end_gain = random.uniform(min_gain, max_gain)
+        envelope = torch.linspace(1.0, end_gain, steps=T, dtype=x.dtype, device=x.device).unsqueeze(1)
+        return x * envelope
+
     def __getitem__(self, idx):
         item = self.items[idx]
+        x = torch.tensor(item["x"], dtype=torch.float32)
+        if self.augment:
+            x = self._augment_x(x)
+
         return {
-            "x": torch.tensor(item["x"], dtype=torch.float32),
+            "x": x,
             "chord_targets": torch.tensor(item["chord_targets"], dtype=torch.long),
             "chord_change_targets": torch.tensor(item["chord_change_targets"], dtype=torch.long),
             "mask": torch.tensor(item["mask"], dtype=torch.float32),
@@ -281,9 +354,9 @@ def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
     val_items = build_items_from_ids(cfg.root_dir, val_ids, vocab, cfg)
     test_items = build_items_from_ids(cfg.root_dir, test_ids, vocab, cfg)
 
-    train_dataset = ProcessedChordDataset(train_items)
-    val_dataset = ProcessedChordDataset(val_items)
-    test_dataset = ProcessedChordDataset(test_items)
+    train_dataset = ProcessedChordDataset(train_items, augment=cfg.augment_train, cfg=cfg)
+    val_dataset = ProcessedChordDataset(val_items, augment=False, cfg=cfg)
+    test_dataset = ProcessedChordDataset(test_items, augment=False, cfg=cfg)
 
     train_loader = DataLoader(
         train_dataset,

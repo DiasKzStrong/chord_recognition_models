@@ -1,0 +1,8 @@
+numpy>=1.24,<3.0
+torch>=2.1
+torchaudio>=2.1
+librosa>=0.10,<1.0
+soundfile>=0.12
+audioread>=3.0
+scipy>=1.10
+tqdm>=4.66

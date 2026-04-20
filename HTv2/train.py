@@ -345,16 +345,16 @@ def run_one_fold(
 
     hp = HyperParameters(
         n_steps=cfg.n_steps,
-        input_embed_size=256,
-        n_layers=4,
-        n_heads=8,
+        input_embed_size=128,
+        n_layers=2,
+        n_heads=4,
     )
 
     model = HTv2ChordModel(
         input_dim=input_dim,
         n_chords=n_chords,
         hyperparameters=hp,
-        dropout_rate=0.1,
+        dropout_rate=0.2,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -393,7 +393,7 @@ def run_one_fold(
             device=device,
             slope=1.0,
             chord_loss_weight=1.0,
-            change_loss_weight=0.5,
+            change_loss_weight=0,
             grad_clip=args.grad_clip,
         )
 
@@ -403,7 +403,7 @@ def run_one_fold(
             device=device,
             slope=1.0,
             chord_loss_weight=1.0,
-            change_loss_weight=0.5,
+            change_loss_weight=0,
         )
 
         scheduler.step(val_metrics["loss"])

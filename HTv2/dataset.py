@@ -8,6 +8,36 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
+TARGET_CLASSES = [
+    "Others",
+    "min/b7",
+    "min/2",
+    "maj/b7",
+    "maj/2",
+    "sus4(b7)",
+    "sus2",
+    "sus4",
+    "13",
+    "11",
+    "min9",
+    "9",
+    "maj9",
+    "dim7",
+    "hdim7",
+    "min7",
+    "7",
+    "maj7",
+    "min/5",
+    "min/b3",
+    "maj/5",
+    "maj/3",
+    "dim",
+    "aug",
+    "min",
+    "maj",
+    "N",
+]
+
 @dataclass
 class ProcessedChordConfig:
     root_dir: str
@@ -35,6 +65,54 @@ class ChordVocab:
     def size(self) -> int:
         return len(self.idx_to_chord)
 
+
+class FixedChordVocab:
+    def __init__(self):
+        self.idx_to_chord = TARGET_CLASSES
+        self.chord_to_idx = {c: i for i, c in enumerate(self.idx_to_chord)}
+
+    def encode(self, label: str) -> int:
+        return self.chord_to_idx[label]
+
+    def decode(self, idx: int) -> str:
+        return self.idx_to_chord[idx]
+
+    @property
+    def size(self):
+        return len(self.idx_to_chord)
+
+def chord_label_to_quality(label: str | None) -> str:
+    if label is None:
+        return "Others"
+
+    label = str(label).strip()
+
+    if label == "" or label.upper() == "N":
+        return "N"
+
+    if ":" not in label:
+        return "Others"
+
+    _, quality = label.split(":", 1)
+    quality = quality.strip().replace(" ", "")
+
+    # exact supported classes
+    if quality in TARGET_CLASSES:
+        return quality
+
+    # optional soft mappings
+    if quality == "maj6":
+        return "maj"
+    if quality == "min6":
+        return "min"
+    if quality == "maj6/9":
+        return "maj9"
+    if quality == "min6/9":
+        return "min9"
+    if quality == "minmaj7":
+        return "min7"
+
+    return "Others"
 
 def load_fold_split(fold_json_path: str):
     with open(fold_json_path, "r", encoding="utf-8") as f:
@@ -175,9 +253,10 @@ def build_items_from_ids(root_dir: str, track_ids: List[str], vocab: ChordVocab,
         sample = load_processed_npz(npz_path)
 
         x = sample["x"]  # [T, F]
-        label_strings = sample["labels"]
+        raw_label_strings = sample["labels"]
 
-        chord_targets = np.array([vocab.encode(lbl) for lbl in label_strings], dtype=np.int64)
+        quality_labels = [chord_label_to_quality(lbl) for lbl in raw_label_strings]
+        chord_targets = np.array([vocab.encode(lbl) for lbl in quality_labels], dtype=np.int64)
         chord_change_targets = make_chord_change_targets(chord_targets)
 
         items.extend(
@@ -196,7 +275,7 @@ def build_items_from_ids(root_dir: str, track_ids: List[str], vocab: ChordVocab,
 def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
     train_ids, val_ids, test_ids = load_fold_split(fold_json_path)
 
-    vocab = build_vocab_from_train_ids(cfg.root_dir, train_ids)
+    vocab = FixedChordVocab()
 
     train_items = build_items_from_ids(cfg.root_dir, train_ids, vocab, cfg)
     val_items = build_items_from_ids(cfg.root_dir, val_ids, vocab, cfg)

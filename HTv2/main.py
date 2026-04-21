@@ -14,6 +14,8 @@ def get_args():
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
     parser.add_argument('--grad_clip', type=float, default=None)
     parser.add_argument('--experiment_name',type=str, help="Experiment name that you currently running")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=4)
     return parser.parse_args()
 
 if __name__ == "__main__":

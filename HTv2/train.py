@@ -322,8 +322,8 @@ def run_one_fold(
         root_dir=root_dir,
         n_steps=128,
         stride=64,
-        batch_size=8,
-        num_workers=0,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
     )
 
     train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader, vocab = \

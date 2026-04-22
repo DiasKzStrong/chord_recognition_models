@@ -419,8 +419,12 @@ def compute_train_statistics(dataset, vocab):
     change_pos = 0.0
     valid_total = 0.0
 
-    for item in dataset.items:
-        mask = item["mask"].astype(bool)
+    raw_items = dataset.songs if hasattr(dataset, "songs") else dataset.items
+    for item in raw_items:
+        if "mask" in item:
+            mask = item["mask"].astype(bool)
+        else:
+            mask = np.ones_like(item["chord_targets"], dtype=bool)
         targets = item["chord_targets"][mask]
         changes = item["chord_change_targets"][mask]
         class_counts += np.bincount(targets, minlength=vocab.size)
@@ -493,6 +497,20 @@ def format_worst_classes(per_class_acc: Dict[str, float], limit: int = 6) -> str
     return ", ".join(f"{name}:{acc:.3f}" for name, acc in items)
 
 
+def print_paper_comparison(result: Dict[str, object]) -> None:
+    print(
+        "Paper-style chord-class metrics | "
+        f"HTv2 accframe={result['test_accframe']:.4f} | "
+        f"HTv2 accclass={result['test_accclass']:.4f} | "
+        "ChordFormer no-reweight accframe=0.7877 accclass=0.3884 | "
+        "CNN+BLSTM no-reweight accframe=0.7676 accclass=0.3315"
+    )
+    print(
+        "Note: Root/MajMin/MIREX from ChordFormer are not computed here because "
+        "this HTv2 run predicts rootless 27-way chord-class labels."
+    )
+
+
 def run_one_fold(
     fold_json_path,
     root_dir,
@@ -505,6 +523,7 @@ def run_one_fold(
         stride=args.stride,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        window_mode=args.window_mode,
         augment_train=args.augment,
         noise_std=args.noise_std,
         gain_min=args.gain_min,
@@ -512,6 +531,7 @@ def run_one_fold(
         time_mask_width=args.time_mask_width,
         freq_mask_width=args.freq_mask_width,
         pitch_shift_bins=args.pitch_shift_bins,
+        pitch_shift_semitones=args.pitch_shift_semitones,
         use_signal_decay=args.use_signal_decay,
         signal_decay_min=args.signal_decay_min,
         signal_decay_max=args.signal_decay_max,
@@ -674,7 +694,7 @@ def run_one_fold(
     )
     print(f"{fold_name} worst test classes: {format_worst_classes(test_metrics['per_class_acc'])}")
 
-    return {
+    result = {
         "fold_file": os.path.basename(fold_json_path),
         "best_val_score": best_val_score,
         "best_val_loss": best_val_loss,
@@ -683,6 +703,8 @@ def run_one_fold(
         "test_change_loss": test_metrics["change_loss"],
         "test_chord_acc": test_metrics["chord_acc"],
         "test_macro_chord_acc": test_metrics["macro_chord_acc"],
+        "test_accframe": test_metrics["chord_acc"],
+        "test_accclass": test_metrics["macro_chord_acc"],
         "test_change_acc": test_metrics["change_acc"],
         "test_change_precision": test_metrics["change_precision"],
         "test_change_recall": test_metrics["change_recall"],
@@ -693,6 +715,9 @@ def run_one_fold(
         "num_val_windows": len(val_dataset),
         "num_test_windows": len(test_dataset),
     }
+    if args.paper_compare:
+        print_paper_comparison(result)
+    return result
 
 
 def run_cross_validation(root_dir, device, args):
@@ -724,6 +749,8 @@ def run_cross_validation(root_dir, device, args):
             f"test_loss={fold_result['test_loss']:.4f} | "
             f"test_chord_acc={fold_result['test_chord_acc']:.4f} | "
             f"test_macro_chord_acc={fold_result['test_macro_chord_acc']:.4f} | "
+            f"test_accframe={fold_result['test_accframe']:.4f} | "
+            f"test_accclass={fold_result['test_accclass']:.4f} | "
             f"test_change_f1={fold_result['test_change_f1']:.4f}"
         )
 
@@ -733,6 +760,10 @@ def run_cross_validation(root_dir, device, args):
     std_test_chord_acc = np.std([r["test_chord_acc"] for r in all_results])
     mean_test_macro_chord_acc = np.mean([r["test_macro_chord_acc"] for r in all_results])
     std_test_macro_chord_acc = np.std([r["test_macro_chord_acc"] for r in all_results])
+    mean_test_accframe = np.mean([r["test_accframe"] for r in all_results])
+    std_test_accframe = np.std([r["test_accframe"] for r in all_results])
+    mean_test_accclass = np.mean([r["test_accclass"] for r in all_results])
+    std_test_accclass = np.std([r["test_accclass"] for r in all_results])
     mean_test_change_f1 = np.mean([r["test_change_f1"] for r in all_results])
     std_test_change_f1 = np.std([r["test_change_f1"] for r in all_results])
 
@@ -745,6 +776,8 @@ def run_cross_validation(root_dir, device, args):
             f"test_loss={r['test_loss']:.4f}, "
             f"test_chord_acc={r['test_chord_acc']:.4f}, "
             f"test_macro_chord_acc={r['test_macro_chord_acc']:.4f}, "
+            f"test_accframe={r['test_accframe']:.4f}, "
+            f"test_accclass={r['test_accclass']:.4f}, "
             f"test_change_f1={r['test_change_f1']:.4f}"
         )
 
@@ -752,6 +785,12 @@ def run_cross_validation(root_dir, device, args):
     print(f"mean_test_loss            = {mean_test_loss:.4f} ± {std_test_loss:.4f}")
     print(f"mean_test_chord_acc       = {mean_test_chord_acc:.4f} ± {std_test_chord_acc:.4f}")
     print(f"mean_test_macro_chord_acc = {mean_test_macro_chord_acc:.4f} ± {std_test_macro_chord_acc:.4f}")
+    print(f"mean_test_accframe        = {mean_test_accframe:.4f} ± {std_test_accframe:.4f}")
+    print(f"mean_test_accclass        = {mean_test_accclass:.4f} ± {std_test_accclass:.4f}")
     print(f"mean_test_change_f1       = {mean_test_change_f1:.4f} ± {std_test_change_f1:.4f}")
+    if args.paper_compare:
+        print("-" * 80)
+        print("ChordFormer Table III no-reweight reference: accframe=0.7877, accclass=0.3884")
+        print("CNN+BLSTM Table III no-reweight reference: accframe=0.7676, accclass=0.3315")
 
     return all_results

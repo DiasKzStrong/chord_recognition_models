@@ -21,6 +21,8 @@ def get_args():
     parser.add_argument('--stride', type=int, default=64)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--window_mode', type=str, default="sliding", choices=["sliding", "random_song"],
+                        help="sliding uses overlapping windows; random_song samples one random segment per train song per epoch.")
     parser.add_argument('--embed_size', type=int, default=256)
     parser.add_argument('--n_layers', type=int, default=4)
     parser.add_argument('--n_heads', type=int, default=8)
@@ -44,6 +46,8 @@ def get_args():
     parser.add_argument('--time_mask_width', type=int, default=8)
     parser.add_argument('--freq_mask_width', type=int, default=12)
     parser.add_argument('--pitch_shift_bins', type=int, default=0)
+    parser.add_argument('--pitch_shift_semitones', type=int, default=0,
+                        help="Train-only CQT roll in semitones when --augment is enabled; labels are unchanged for quality-only targets.")
     parser.add_argument('--use_signal_decay', action="store_true",
                         help="Apply train-only linear signal decay when --augment is enabled.")
     parser.add_argument('--signal_decay_min', type=float, default=0.4,
@@ -57,6 +61,8 @@ def get_args():
     parser.add_argument('--num_folds', type=int, default=5)
     parser.add_argument('--fold_ids', type=str, default="",
                         help="Comma-separated fold ids, e.g. '0' or '0,1'. Overrides --num_folds.")
+    parser.add_argument('--paper_compare', action="store_true",
+                        help="Print ChordFormer-style accframe/accclass aliases and paper reference numbers.")
     parser.add_argument('--root_dir', type=str, default=None)
     return parser.parse_args()
 

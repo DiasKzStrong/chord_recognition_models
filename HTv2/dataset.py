@@ -46,6 +46,7 @@ class ProcessedChordConfig:
     stride: int = 64
     batch_size: int = 8
     num_workers: int = 0
+    window_mode: str = "sliding"
     augment_train: bool = False
     noise_std: float = 0.01
     gain_min: float = 0.9
@@ -53,6 +54,7 @@ class ProcessedChordConfig:
     time_mask_width: int = 8
     freq_mask_width: int = 12
     pitch_shift_bins: int = 0
+    pitch_shift_semitones: int = 0
     use_signal_decay: bool = False
     signal_decay_min: float = 0.4
     signal_decay_max: float = 0.9
@@ -231,6 +233,18 @@ def slice_into_windows(
     return items
 
 
+def make_song_item(
+    x: np.ndarray,
+    chord_targets: np.ndarray,
+    chord_change_targets: np.ndarray,
+):
+    return {
+        "x": x.astype(np.float32),
+        "chord_targets": chord_targets.astype(np.int64),
+        "chord_change_targets": chord_change_targets.astype(np.int64),
+    }
+
+
 class ProcessedChordDataset(Dataset):
     def __init__(self, items: List[Dict], augment: bool = False, cfg: ProcessedChordConfig | None = None):
         self.items = items
@@ -273,6 +287,12 @@ class ProcessedChordDataset(Dataset):
             if shift != 0:
                 x = torch.roll(x, shifts=shift, dims=1)
 
+        if self.cfg.pitch_shift_semitones > 0 and F > 1:
+            semitones = random.randint(-self.cfg.pitch_shift_semitones, self.cfg.pitch_shift_semitones)
+            shift_bins = semitones * 3
+            if shift_bins != 0:
+                x = torch.roll(x, shifts=shift_bins, dims=1)
+
         return x
 
     def _apply_signal_decay(self, x: torch.Tensor) -> torch.Tensor:
@@ -300,6 +320,50 @@ class ProcessedChordDataset(Dataset):
         }
 
 
+class RandomSongSegmentDataset(Dataset):
+    def __init__(self, songs: List[Dict], cfg: ProcessedChordConfig, augment: bool = False):
+        self.songs = songs
+        self.cfg = cfg
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.songs)
+
+    def _slice_song(self, item: Dict):
+        x = item["x"]
+        chord_targets = item["chord_targets"]
+        chord_change_targets = item["chord_change_targets"]
+        total_frames = x.shape[0]
+        n_steps = self.cfg.n_steps
+
+        if total_frames <= n_steps:
+            pad_len = n_steps - total_frames
+            x_out = np.pad(x, ((0, pad_len), (0, 0)), mode="constant")
+            chord_out = np.pad(chord_targets, (0, pad_len), mode="constant", constant_values=0)
+            change_out = np.pad(chord_change_targets, (0, pad_len), mode="constant", constant_values=0)
+            mask = np.zeros(n_steps, dtype=np.float32)
+            mask[:total_frames] = 1.0
+        else:
+            start = random.randint(0, total_frames - n_steps)
+            end = start + n_steps
+            x_out = x[start:end]
+            chord_out = chord_targets[start:end]
+            change_out = chord_change_targets[start:end]
+            mask = np.ones(n_steps, dtype=np.float32)
+
+        return {
+            "x": x_out.astype(np.float32),
+            "chord_targets": chord_out.astype(np.int64),
+            "chord_change_targets": change_out.astype(np.int64),
+            "mask": mask,
+        }
+
+    def __getitem__(self, idx):
+        item = self._slice_song(self.songs[idx])
+        sample = ProcessedChordDataset([item], augment=self.augment, cfg=self.cfg)[0]
+        return sample
+
+
 def build_vocab_from_train_ids(root_dir: str, train_ids: List[str]) -> ChordVocab:
     all_labels = []
 
@@ -315,8 +379,15 @@ def build_vocab_from_train_ids(root_dir: str, train_ids: List[str]) -> ChordVoca
     return ChordVocab(all_labels)
 
 
-def build_items_from_ids(root_dir: str, track_ids: List[str], vocab: ChordVocab, cfg: ProcessedChordConfig):
+def build_items_from_ids(
+    root_dir: str,
+    track_ids: List[str],
+    vocab: ChordVocab,
+    cfg: ProcessedChordConfig,
+    window_mode: str | None = None,
+):
     items = []
+    mode = window_mode or cfg.window_mode
 
     for track_id in track_ids:
         npz_path = os.path.join(root_dir, "processed", f"{track_id}.npz")
@@ -332,15 +403,26 @@ def build_items_from_ids(root_dir: str, track_ids: List[str], vocab: ChordVocab,
         chord_targets = np.array([vocab.encode(lbl) for lbl in quality_labels], dtype=np.int64)
         chord_change_targets = make_chord_change_targets(chord_targets)
 
-        items.extend(
-            slice_into_windows(
-                x=x,
-                chord_targets=chord_targets,
-                chord_change_targets=chord_change_targets,
-                n_steps=cfg.n_steps,
-                stride=cfg.stride,
+        if mode == "random_song":
+            items.append(
+                make_song_item(
+                    x=x,
+                    chord_targets=chord_targets,
+                    chord_change_targets=chord_change_targets,
+                )
             )
-        )
+        elif mode == "sliding":
+            items.extend(
+                slice_into_windows(
+                    x=x,
+                    chord_targets=chord_targets,
+                    chord_change_targets=chord_change_targets,
+                    n_steps=cfg.n_steps,
+                    stride=cfg.stride,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported window_mode: {mode}")
 
     return items
 
@@ -350,13 +432,18 @@ def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
 
     vocab = FixedChordVocab()
 
-    train_items = build_items_from_ids(cfg.root_dir, train_ids, vocab, cfg)
-    val_items = build_items_from_ids(cfg.root_dir, val_ids, vocab, cfg)
-    test_items = build_items_from_ids(cfg.root_dir, test_ids, vocab, cfg)
+    train_items = build_items_from_ids(cfg.root_dir, train_ids, vocab, cfg, window_mode=cfg.window_mode)
+    val_items = build_items_from_ids(cfg.root_dir, val_ids, vocab, cfg, window_mode="sliding")
+    test_items = build_items_from_ids(cfg.root_dir, test_ids, vocab, cfg, window_mode="sliding")
 
-    train_dataset = ProcessedChordDataset(train_items, augment=cfg.augment_train, cfg=cfg)
-    val_dataset = ProcessedChordDataset(val_items, augment=False, cfg=cfg)
-    test_dataset = ProcessedChordDataset(test_items, augment=False, cfg=cfg)
+    if cfg.window_mode == "random_song":
+        train_dataset = RandomSongSegmentDataset(train_items, cfg=cfg, augment=cfg.augment_train)
+        val_dataset = ProcessedChordDataset(val_items, augment=False, cfg=cfg)
+        test_dataset = ProcessedChordDataset(test_items, augment=False, cfg=cfg)
+    else:
+        train_dataset = ProcessedChordDataset(train_items, augment=cfg.augment_train, cfg=cfg)
+        val_dataset = ProcessedChordDataset(val_items, augment=False, cfg=cfg)
+        test_dataset = ProcessedChordDataset(test_items, augment=False, cfg=cfg)
 
     train_loader = DataLoader(
         train_dataset,

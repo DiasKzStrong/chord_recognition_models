@@ -6,10 +6,103 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import *
 from model import *
+
+
+def is_distributed() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_distributed() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_distributed() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def maybe_barrier() -> None:
+    if is_distributed():
+        dist.barrier()
+
+
+def distributed_sum_scalar(value: float, device: torch.device) -> float:
+    if not is_distributed():
+        return value
+    tensor = torch.tensor(float(value), device=device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
+def distributed_sum_array(values: np.ndarray, device: torch.device) -> np.ndarray:
+    if not is_distributed():
+        return values
+    tensor = torch.from_numpy(values).to(device=device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.cpu().numpy()
+
+
+def sync_epoch_state(state: Dict[str, object], device: torch.device) -> Dict[str, object]:
+    if not is_distributed():
+        return state
+
+    synced = dict(state)
+    scalar_keys = [
+        "loss_sum",
+        "chord_loss_sum",
+        "change_loss_sum",
+        "total",
+        "chord_correct",
+        "change_correct",
+        "change_tp",
+        "change_fp",
+        "change_fn",
+        "paper_root_correct",
+        "paper_thirds_correct",
+        "paper_majmin_correct",
+        "paper_triads_correct",
+        "paper_sevenths_correct",
+        "paper_tetrads_correct",
+    ]
+    for key in scalar_keys:
+        value = distributed_sum_scalar(state[key], device)
+        if key.endswith("_sum"):
+            synced[key] = value
+        else:
+            synced[key] = int(round(value))
+
+    synced["per_class_total"] = distributed_sum_array(state["per_class_total"], device)
+    synced["per_class_correct"] = distributed_sum_array(state["per_class_correct"], device)
+    return synced
+
+
+def make_progress(total_items: Optional[int], desc: str):
+    if not is_main_process():
+        return tqdm(total=0, desc=desc, unit="sample", leave=False, disable=True)
+    return tqdm(total=total_items, desc=desc, unit="sample", leave=False)
+
+
+def progress_update_amount(batch_size: int) -> int:
+    return batch_size * get_world_size() if is_distributed() else batch_size
+
+
+def maybe_write(message: str) -> None:
+    if is_main_process():
+        tqdm.write(message)
 
 
 def masked_cross_entropy(
@@ -521,9 +614,12 @@ def train_one_epoch(
     boundary_teacher_forcing_prob=0.0,
 ):
     state = _empty_epoch_state(vocab.size)
-    total_items = len(train_loader.dataset) if hasattr(train_loader, "dataset") else None
+    if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
+        total_items = len(train_loader.sampler) * get_world_size()
+    else:
+        total_items = len(train_loader.dataset) if hasattr(train_loader, "dataset") else None
 
-    progress = tqdm(total=total_items, desc="train", unit="sample", leave=False)
+    progress = make_progress(total_items, "train")
 
     try:
         for batch in train_loader:
@@ -545,7 +641,7 @@ def train_one_epoch(
             )
             _update_epoch_state(state, metrics)
 
-            batch_size = batch["x"].shape[0]
+            batch_size = progress_update_amount(batch["x"].shape[0])
             batch_total = max(int(metrics["total"]), 1)
             progress.update(batch_size)
             progress.set_postfix(
@@ -556,6 +652,7 @@ def train_one_epoch(
     finally:
         progress.close()
 
+    state = sync_epoch_state(state, device)
     return _summarize_epoch_state(state, vocab)
 
 
@@ -573,9 +670,12 @@ def eval_one_epoch(
     label_smoothing=0.0,
 ):
     state = _empty_epoch_state(vocab.size)
-    total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else None
+    if isinstance(getattr(data_loader, "sampler", None), DistributedSampler):
+        total_items = len(data_loader.sampler) * get_world_size()
+    else:
+        total_items = len(data_loader.dataset) if hasattr(data_loader, "dataset") else None
 
-    progress = tqdm(total=total_items, desc="eval", unit="sample", leave=False)
+    progress = make_progress(total_items, "eval")
 
     try:
         for batch in data_loader:
@@ -594,7 +694,7 @@ def eval_one_epoch(
             )
             _update_epoch_state(state, metrics)
 
-            batch_size = batch["x"].shape[0]
+            batch_size = progress_update_amount(batch["x"].shape[0])
             batch_total = max(int(metrics["total"]), 1)
             progress.update(batch_size)
             progress.set_postfix(
@@ -605,6 +705,7 @@ def eval_one_epoch(
     finally:
         progress.close()
 
+    state = sync_epoch_state(state, device)
     return _summarize_epoch_state(state, vocab)
 
 
@@ -800,6 +901,9 @@ def run_one_fold(
         use_signal_decay=args.use_signal_decay,
         signal_decay_min=args.signal_decay_min,
         signal_decay_max=args.signal_decay_max,
+        distributed=is_distributed(),
+        rank=get_rank(),
+        world_size=get_world_size(),
     )
 
     train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader, vocab = \
@@ -817,10 +921,11 @@ def run_one_fold(
     n_chords = vocab.size
 
     fold_name = os.path.splitext(os.path.basename(fold_json_path))[0]
-    print(f"Vocab size {n_chords}")
+    maybe_write(f"Vocab size {n_chords}")
 
     stats = compute_train_statistics(train_dataset, vocab)
-    print_fold_data_summary(fold_name, train_dataset, val_dataset, test_dataset, stats, vocab)
+    if is_main_process():
+        print_fold_data_summary(fold_name, train_dataset, val_dataset, test_dataset, stats, vocab)
 
     chord_class_weights = make_class_weights(stats["class_counts"], args.class_weighting)
     component_class_weights = None
@@ -833,10 +938,10 @@ def run_one_fold(
         args.max_change_pos_weight,
     )
     if chord_class_weights is not None:
-        print(f"{fold_name} class weights enabled: mode={args.class_weighting}")
+        maybe_write(f"{fold_name} class weights enabled: mode={args.class_weighting}")
     if component_class_weights is not None:
-        print(f"{fold_name} structured component weights enabled: mode={args.class_weighting}")
-    print(f"{fold_name} boundary pos_weight={change_pos_weight.item():.2f}")
+        maybe_write(f"{fold_name} structured component weights enabled: mode={args.class_weighting}")
+    maybe_write(f"{fold_name} boundary pos_weight={change_pos_weight.item():.2f}")
 
     hp = HyperParameters(
         n_steps=cfg.n_steps,
@@ -865,6 +970,12 @@ def run_one_fold(
             dropout_rate=args.dropout,
         ).to(device)
 
+    if is_distributed():
+        if device.type == "cuda":
+            model = DDP(model, device_ids=[device.index], output_device=device.index)
+        else:
+            model = DDP(model)
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -884,13 +995,21 @@ def run_one_fold(
     best_state_dict = None
     epochs_without_improvement = 0
 
-    epoch_progress = tqdm(range(args.max_n_epochs), desc=os.path.basename(fold_json_path), unit="epoch")
+    epoch_progress = tqdm(
+        range(args.max_n_epochs),
+        desc=os.path.basename(fold_json_path),
+        unit="epoch",
+        disable=not is_main_process(),
+    )
 
     ckpt_dir = os.path.join(root_dir, "checkpoints", args.experiment_name)
     os.makedirs(ckpt_dir, exist_ok=True)
     best_ckpt_path = os.path.join(ckpt_dir, f"{fold_name}_best.pt")
 
     for epoch in epoch_progress:
+        if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
+
         boundary_tf_prob = teacher_forcing_prob_for_epoch(epoch, args.boundary_teacher_forcing_epochs)
 
         train_metrics = train_one_epoch(
@@ -935,7 +1054,7 @@ def run_one_fold(
             val_macro=f"{val_metrics['macro_chord_acc']:.4f}",
         )
 
-        tqdm.write(
+        maybe_write(
             f"{os.path.basename(fold_json_path)} | "
             f"Epoch {epoch+1:02d} | "
             f"lr={current_lr:.2e} | "
@@ -952,19 +1071,20 @@ def run_one_fold(
         if improved or (val_score == best_val_score and val_metrics["loss"] < best_val_loss):
             best_val_score = val_score
             best_val_loss = val_metrics["loss"]
-            best_state_dict = copy.deepcopy(model.state_dict())
-            torch.save(best_state_dict, best_ckpt_path)
+            best_state_dict = copy.deepcopy(unwrap_model(model).state_dict())
+            if is_main_process():
+                torch.save(best_state_dict, best_ckpt_path)
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 
         if epochs_without_improvement >= args.patience:
-            tqdm.write(f"Early stopping on {os.path.basename(fold_json_path)}")
+            maybe_write(f"Early stopping on {os.path.basename(fold_json_path)}")
             break
 
     if best_state_dict is None:
-        best_state_dict = copy.deepcopy(model.state_dict())
-    model.load_state_dict(best_state_dict)
+        best_state_dict = copy.deepcopy(unwrap_model(model).state_dict())
+    unwrap_model(model).load_state_dict(best_state_dict)
 
     test_metrics = eval_one_epoch(
         model=model,
@@ -979,7 +1099,7 @@ def run_one_fold(
         component_class_weights=component_class_weights,
         label_smoothing=args.label_smoothing,
     )
-    print(f"{fold_name} worst test classes: {format_worst_classes(test_metrics['per_class_acc'])}")
+    maybe_write(f"{fold_name} worst test classes: {format_worst_classes(test_metrics['per_class_acc'])}")
 
     result = {
         "fold_file": os.path.basename(fold_json_path),
@@ -1018,7 +1138,8 @@ def run_one_fold(
         "num_test_windows": len(test_dataset),
     }
     if args.paper_compare:
-        print_paper_comparison(result)
+        if is_main_process():
+            print_paper_comparison(result)
     return result
 
 
@@ -1033,10 +1154,10 @@ def run_cross_validation(root_dir, device, args):
     fold_files = [os.path.join(splits_dir, f"fold_{i}.json") for i in fold_indices]
     all_results = []
 
-    for fold_json_path in tqdm(fold_files, desc="folds", unit="fold"):
-        tqdm.write("=" * 80)
-        tqdm.write(f"Running {os.path.basename(fold_json_path)}")
-        tqdm.write("=" * 80)
+    for fold_json_path in tqdm(fold_files, desc="folds", unit="fold", disable=not is_main_process()):
+        maybe_write("=" * 80)
+        maybe_write(f"Running {os.path.basename(fold_json_path)}")
+        maybe_write("=" * 80)
 
         fold_result = run_one_fold(
             fold_json_path=fold_json_path,
@@ -1045,6 +1166,7 @@ def run_cross_validation(root_dir, device, args):
             args=args,
         )
         all_results.append(fold_result)
+        maybe_barrier()
 
         paper_metric_text = ""
         if fold_result["label_mode"] in {"full_chord", "structured_full_chord"}:
@@ -1053,7 +1175,7 @@ def run_cross_validation(root_dir, device, args):
                 f"test_mirex_proxy={fold_result['test_accframe']:.4f}"
             )
 
-        tqdm.write(
+        maybe_write(
             f"Finished {fold_result['fold_file']} | "
             f"test_loss={fold_result['test_loss']:.4f} | "
             f"test_chord_acc={fold_result['test_chord_acc']:.4f} | "
@@ -1080,6 +1202,9 @@ def run_cross_validation(root_dir, device, args):
         r for r in all_results
         if r["label_mode"] in {"full_chord", "structured_full_chord"}
     ]
+
+    if not is_main_process():
+        return all_results
 
     print("\n" + "=" * 80)
     print("Cross-validation summary")

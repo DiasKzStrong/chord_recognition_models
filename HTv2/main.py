@@ -2,6 +2,7 @@ from train import run_cross_validation
 import torch
 import argparse 
 import os
+import torch.distributed as dist
 
 def get_args():
     parser = argparse.ArgumentParser("HTv2 arguments")
@@ -69,15 +70,53 @@ def get_args():
     parser.add_argument('--root_dir', type=str, default=None)
     return parser.parse_args()
 
+
+def init_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl"
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            backend = "gloo"
+            device = torch.device("cpu")
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    return distributed, world_size, rank, local_rank, device
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
 if __name__ == "__main__":
     args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device : {device}")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    root_dir = args.root_dir or os.path.join(script_dir, "chord_data_1217")
-    
-    _ = run_cross_validation(
-        root_dir=root_dir,
-        device=device,  
-        args=args
-    )
+    distributed, world_size, rank, local_rank, device = init_distributed()
+
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        if rank == 0:
+            print(f"Device : {device}")
+            if distributed:
+                print(f"Distributed : world_size={world_size}")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dir = args.root_dir or os.path.join(script_dir, "chord_data_1217")
+
+        _ = run_cross_validation(
+            root_dir=root_dir,
+            device=device,
+            args=args
+        )
+    finally:
+        cleanup_distributed()

@@ -7,7 +7,7 @@ import re
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, DistributedSampler, Sampler
 
 
 TARGET_CLASSES = [
@@ -60,6 +60,9 @@ class ProcessedChordConfig:
     use_signal_decay: bool = False
     signal_decay_min: float = 0.4
     signal_decay_max: float = 0.9
+    distributed: bool = False
+    rank: int = 0
+    world_size: int = 1
 
 
 class ChordVocab:
@@ -586,6 +589,22 @@ class ProcessedChordDataset(Dataset):
         return sample
 
 
+class DistributedEvalSampler(Sampler[int]):
+    def __init__(self, dataset: Dataset, num_replicas: int, rank: int):
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.num_replicas))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.rank
+        if remaining <= 0:
+            return 0
+        return (remaining + self.num_replicas - 1) // self.num_replicas
+
+
 class RandomSongSegmentDataset(Dataset):
     def __init__(self, songs: List[Dict], cfg: ProcessedChordConfig, augment: bool = False):
         self.songs = songs
@@ -787,23 +806,53 @@ def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
         val_dataset = ProcessedChordDataset(val_items, augment=False, cfg=cfg)
         test_dataset = ProcessedChordDataset(test_items, augment=False, cfg=cfg)
 
+    train_sampler = None
+    val_sampler = None
+    test_sampler = None
+    if cfg.distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=cfg.world_size,
+            rank=cfg.rank,
+            shuffle=True,
+            drop_last=False,
+        )
+        val_sampler = DistributedEvalSampler(
+            val_dataset,
+            num_replicas=cfg.world_size,
+            rank=cfg.rank,
+        )
+        test_sampler = DistributedEvalSampler(
+            test_dataset,
+            num_replicas=cfg.world_size,
+            rank=cfg.rank,
+        )
+
+    loader_kwargs = {
+        "batch_size": cfg.batch_size,
+        "num_workers": cfg.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
+        sampler=val_sampler,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
+        sampler=test_sampler,
+        **loader_kwargs,
     )
 
     return train_dataset, val_dataset, test_dataset, train_loader, val_loader, test_loader, vocab

@@ -130,6 +130,125 @@ def _metric_counts(
     }
 
 
+def parse_full_chord(chord: str) -> tuple[str, str]:
+    if chord is None or chord == "N" or ":" not in chord:
+        return "N", "N"
+    root, quality = chord.split(":", 1)
+    return root, quality
+
+
+def chord_family(quality: str) -> str:
+    if quality == "N":
+        return "N"
+    if quality.startswith("maj") or quality in {"7", "9", "11", "13", "sus4(b7)", "maj/2", "maj/3", "maj/5", "maj/b7"}:
+        return "maj"
+    if quality.startswith("min") or quality in {"min/2", "min/5", "min/b3", "min/b7"}:
+        return "min"
+    if quality.startswith("dim") or quality == "hdim7":
+        return "dim"
+    if quality == "aug":
+        return "aug"
+    if quality.startswith("sus"):
+        return "sus"
+    return "other"
+
+
+def seventh_family(quality: str) -> str:
+    if quality == "N":
+        return "N"
+    if quality in {"maj7", "maj9"}:
+        return "maj7"
+    if quality in {"7", "9", "11", "13", "maj/b7", "sus4(b7)"}:
+        return "7"
+    if quality in {"min7", "min9", "min/b7"}:
+        return "min7"
+    if quality in {"dim7"}:
+        return "dim7"
+    if quality in {"hdim7"}:
+        return "hdim7"
+    return "none"
+
+
+def _full_chord_metric_arrays(vocab):
+    cache = getattr(vocab, "_full_chord_metric_arrays", None)
+    if cache is not None:
+        return cache
+
+    root_to_id = {
+        "N": 0,
+        "C": 1,
+        "C#": 2,
+        "D": 3,
+        "D#": 4,
+        "E": 5,
+        "F": 6,
+        "F#": 7,
+        "G": 8,
+        "G#": 9,
+        "A": 10,
+        "A#": 11,
+        "B": 12,
+    }
+    family_to_id = {"N": 0, "maj": 1, "min": 2, "dim": 3, "aug": 4, "sus": 5, "other": 6}
+    seventh_to_id = {"N": 0, "maj7": 1, "7": 2, "min7": 3, "dim7": 4, "hdim7": 5, "none": 6}
+
+    root_ids = np.zeros(vocab.size, dtype=np.int64)
+    family_ids = np.zeros(vocab.size, dtype=np.int64)
+    seventh_ids = np.zeros(vocab.size, dtype=np.int64)
+    majmin_eligible = np.zeros(vocab.size, dtype=bool)
+
+    for idx in range(vocab.size):
+        root, quality = parse_full_chord(vocab.decode(idx))
+        family = chord_family(quality)
+        root_ids[idx] = root_to_id.get(root, 0)
+        family_ids[idx] = family_to_id.get(family, family_to_id["other"])
+        seventh_ids[idx] = seventh_to_id.get(seventh_family(quality), seventh_to_id["none"])
+        majmin_eligible[idx] = family in {"maj", "min", "N"}
+
+    cache = {
+        "root_ids": root_ids,
+        "family_ids": family_ids,
+        "seventh_ids": seventh_ids,
+        "majmin_eligible": majmin_eligible,
+    }
+    setattr(vocab, "_full_chord_metric_arrays", cache)
+    return cache
+
+
+def full_chord_metric_counts(
+    pred_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    mask: torch.Tensor,
+    vocab,
+) -> Dict[str, int]:
+    valid = mask.bool().detach().cpu().reshape(-1).numpy()
+    pred_flat = pred_ids.detach().cpu().reshape(-1).numpy()
+    target_flat = target_ids.detach().cpu().reshape(-1).numpy()
+    arrays = _full_chord_metric_arrays(vocab)
+
+    pred_roots = arrays["root_ids"][pred_flat]
+    target_roots = arrays["root_ids"][target_flat]
+    pred_families = arrays["family_ids"][pred_flat]
+    target_families = arrays["family_ids"][target_flat]
+    pred_sevenths = arrays["seventh_ids"][pred_flat]
+    target_sevenths = arrays["seventh_ids"][target_flat]
+    target_majmin_eligible = arrays["majmin_eligible"][target_flat]
+
+    root_ok = (pred_roots == target_roots) & valid
+    family_ok = (pred_families == target_families) & root_ok
+    majmin_ok = family_ok & target_majmin_eligible
+    seventh_ok = family_ok & (pred_sevenths == target_sevenths)
+
+    return {
+        "paper_root_correct": int(root_ok.sum()),
+        "paper_thirds_correct": int(family_ok.sum()),
+        "paper_majmin_correct": int(majmin_ok.sum()),
+        "paper_triads_correct": int(family_ok.sum()),
+        "paper_sevenths_correct": int(seventh_ok.sum()),
+        "paper_tetrads_correct": int(seventh_ok.sum()),
+    }
+
+
 def _empty_epoch_state(n_chords: int) -> Dict[str, object]:
     return {
         "loss_sum": 0.0,
@@ -143,6 +262,12 @@ def _empty_epoch_state(n_chords: int) -> Dict[str, object]:
         "change_tp": 0,
         "change_fp": 0,
         "change_fn": 0,
+        "paper_root_correct": 0,
+        "paper_thirds_correct": 0,
+        "paper_majmin_correct": 0,
+        "paper_triads_correct": 0,
+        "paper_sevenths_correct": 0,
+        "paper_tetrads_correct": 0,
     }
 
 
@@ -159,9 +284,18 @@ def _update_epoch_state(state: Dict[str, object], metrics: Dict[str, object]) ->
     state["change_tp"] += int(metrics["change_tp"])
     state["change_fp"] += int(metrics["change_fp"])
     state["change_fn"] += int(metrics["change_fn"])
+    for key in (
+        "paper_root_correct",
+        "paper_thirds_correct",
+        "paper_majmin_correct",
+        "paper_triads_correct",
+        "paper_sevenths_correct",
+        "paper_tetrads_correct",
+    ):
+        state[key] += int(metrics.get(key, 0))
 
 
-def _summarize_epoch_state(state: Dict[str, object], vocab: FixedChordVocab) -> Dict[str, object]:
+def _summarize_epoch_state(state: Dict[str, object], vocab) -> Dict[str, object]:
     total = max(int(state["total"]), 1)
     per_class_total = state["per_class_total"]
     per_class_correct = state["per_class_correct"]
@@ -182,6 +316,8 @@ def _summarize_epoch_state(state: Dict[str, object], vocab: FixedChordVocab) -> 
         "change_loss": state["change_loss_sum"] / total,
         "chord_acc": int(state["chord_correct"]) / total,
         "macro_chord_acc": float(per_class_acc[seen].mean()) if seen.any() else 0.0,
+        "macro_chord_acc_all": float(per_class_acc.mean()) if len(per_class_acc) else 0.0,
+        "seen_chord_classes": int(seen.sum()),
         "per_class_acc": {
             vocab.decode(i): float(per_class_acc[i])
             for i in range(vocab.size)
@@ -191,6 +327,12 @@ def _summarize_epoch_state(state: Dict[str, object], vocab: FixedChordVocab) -> 
         "change_precision": precision,
         "change_recall": recall,
         "change_f1": f1,
+        "paper_root": int(state["paper_root_correct"]) / total,
+        "paper_thirds": int(state["paper_thirds_correct"]) / total,
+        "paper_majmin": int(state["paper_majmin_correct"]) / total,
+        "paper_triads": int(state["paper_triads_correct"]) / total,
+        "paper_sevenths": int(state["paper_sevenths_correct"]) / total,
+        "paper_tetrads": int(state["paper_tetrads_correct"]) / total,
     }
 
 
@@ -199,7 +341,7 @@ def train_step(
     batch: Dict[str, torch.Tensor],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    n_chords: int,
+    vocab,
     slope: float = 1.0,
     chord_loss_weight: float = 1.0,
     change_loss_weight: float = 1.0,
@@ -246,7 +388,16 @@ def train_step(
     optimizer.step()
 
     with torch.no_grad():
-        counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, n_chords)
+        counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, vocab.size)
+        if getattr(vocab, "label_mode", "") == "full_chord":
+            counts.update(
+                full_chord_metric_counts(
+                    pred_ids=outputs["chord_logits"].argmax(dim=-1),
+                    target_ids=chord_targets,
+                    mask=mask,
+                    vocab=vocab,
+                )
+            )
 
     counts.update({
         "loss": losses["loss"].item(),
@@ -261,7 +412,7 @@ def eval_step(
     model: nn.Module,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
-    n_chords: int,
+    vocab,
     slope: float = 1.0,
     chord_loss_weight: float = 1.0,
     change_loss_weight: float = 1.0,
@@ -295,7 +446,16 @@ def eval_step(
         label_smoothing=label_smoothing,
     )
 
-    counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, n_chords)
+    counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, vocab.size)
+    if getattr(vocab, "label_mode", "") == "full_chord":
+        counts.update(
+            full_chord_metric_counts(
+                pred_ids=outputs["chord_logits"].argmax(dim=-1),
+                target_ids=chord_targets,
+                mask=mask,
+                vocab=vocab,
+            )
+        )
     counts.update({
         "loss": losses["loss"].item(),
         "chord_loss": losses["chord_loss"].item(),
@@ -331,7 +491,7 @@ def train_one_epoch(
                 batch=batch,
                 optimizer=optimizer,
                 device=device,
-                n_chords=vocab.size,
+                vocab=vocab,
                 slope=slope,
                 chord_loss_weight=chord_loss_weight,
                 change_loss_weight=change_loss_weight,
@@ -380,7 +540,7 @@ def eval_one_epoch(
                 model=model,
                 batch=batch,
                 device=device,
-                n_chords=vocab.size,
+                vocab=vocab,
                 slope=slope,
                 chord_loss_weight=chord_loss_weight,
                 change_loss_weight=change_loss_weight,
@@ -498,17 +658,49 @@ def format_worst_classes(per_class_acc: Dict[str, float], limit: int = 6) -> str
 
 
 def print_paper_comparison(result: Dict[str, object]) -> None:
-    print(
-        "Paper-style chord-class metrics | "
-        f"HTv2 accframe={result['test_accframe']:.4f} | "
-        f"HTv2 accclass={result['test_accclass']:.4f} | "
-        "ChordFormer no-reweight accframe=0.7877 accclass=0.3884 | "
-        "CNN+BLSTM no-reweight accframe=0.7676 accclass=0.3315"
-    )
-    print(
-        "Note: Root/MajMin/MIREX from ChordFormer are not computed here because "
-        "this HTv2 run predicts rootless 27-way chord-class labels."
-    )
+    if result["label_mode"] == "full_chord":
+        print(
+            "Paper-style large-vocabulary metrics | "
+            f"HTv2 accframe={result['test_accframe']:.4f} | "
+            f"HTv2 accclass={result['test_accclass']:.4f} | "
+            f"accclass_seen={result['test_accclass_seen']:.4f} | "
+            f"vocab={result['vocab_size']} | "
+            f"seen_test_classes={result['test_seen_chord_classes']}"
+        )
+        print(
+            "Paper-style structural metric proxies | "
+            f"Root={result['test_paper_root']:.4f} | "
+            f"Thirds={result['test_paper_thirds']:.4f} | "
+            f"MajMin={result['test_paper_majmin']:.4f} | "
+            f"Triads={result['test_paper_triads']:.4f} | "
+            f"Sevenths={result['test_paper_sevenths']:.4f} | "
+            f"Tetrads={result['test_paper_tetrads']:.4f} | "
+            f"MIREX_proxy_exact={result['test_accframe']:.4f}"
+        )
+        print(
+            "ChordFormer Table II reference: Root=0.8469 Thirds=0.8175 MajMin=0.8409 "
+            "Triads=0.7755 Sevenths=0.7228 Tetrads=0.6532 MIREX=0.8362"
+        )
+        print(
+            "ChordFormer Table III no-reweight reference: accframe=0.7877 accclass=0.3884 | "
+            "CNN+BLSTM: accframe=0.7676 accclass=0.3315"
+        )
+        print(
+            "Note: structural metrics here are lightweight proxies. Official Root/MIREX-style "
+            "scores should be computed with mir_eval from aligned chord intervals."
+        )
+    else:
+        print(
+            "Quality27 metrics | "
+            f"HTv2 frame_acc={result['test_accframe']:.4f} | "
+            f"HTv2 macro_quality_acc={result['test_accclass_seen']:.4f} | "
+            f"vocab={result['vocab_size']}"
+        )
+        print(
+            "Note: quality27 matches the 27 chord-component labels used in the paper's "
+            "Figure 4 confusion matrix, but it is not comparable to Table II/Table III. "
+            "Use --label_mode full_chord for large-vocabulary comparison."
+        )
 
 
 def run_one_fold(
@@ -524,6 +716,7 @@ def run_one_fold(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         window_mode=args.window_mode,
+        label_mode=args.label_mode,
         augment_train=args.augment,
         noise_std=args.noise_std,
         gain_min=args.gain_min,
@@ -696,6 +889,7 @@ def run_one_fold(
 
     result = {
         "fold_file": os.path.basename(fold_json_path),
+        "label_mode": args.label_mode,
         "best_val_score": best_val_score,
         "best_val_loss": best_val_loss,
         "test_loss": test_metrics["loss"],
@@ -703,8 +897,21 @@ def run_one_fold(
         "test_change_loss": test_metrics["change_loss"],
         "test_chord_acc": test_metrics["chord_acc"],
         "test_macro_chord_acc": test_metrics["macro_chord_acc"],
+        "test_macro_chord_acc_all": test_metrics["macro_chord_acc_all"],
         "test_accframe": test_metrics["chord_acc"],
-        "test_accclass": test_metrics["macro_chord_acc"],
+        "test_accclass": (
+            test_metrics["macro_chord_acc_all"]
+            if args.label_mode == "full_chord"
+            else test_metrics["macro_chord_acc"]
+        ),
+        "test_accclass_seen": test_metrics["macro_chord_acc"],
+        "test_seen_chord_classes": test_metrics["seen_chord_classes"],
+        "test_paper_root": test_metrics["paper_root"],
+        "test_paper_thirds": test_metrics["paper_thirds"],
+        "test_paper_majmin": test_metrics["paper_majmin"],
+        "test_paper_triads": test_metrics["paper_triads"],
+        "test_paper_sevenths": test_metrics["paper_sevenths"],
+        "test_paper_tetrads": test_metrics["paper_tetrads"],
         "test_change_acc": test_metrics["change_acc"],
         "test_change_precision": test_metrics["change_precision"],
         "test_change_recall": test_metrics["change_recall"],
@@ -744,6 +951,13 @@ def run_cross_validation(root_dir, device, args):
         )
         all_results.append(fold_result)
 
+        paper_metric_text = ""
+        if fold_result["label_mode"] == "full_chord":
+            paper_metric_text = (
+                f" | test_root={fold_result['test_paper_root']:.4f} | "
+                f"test_mirex_proxy={fold_result['test_accframe']:.4f}"
+            )
+
         tqdm.write(
             f"Finished {fold_result['fold_file']} | "
             f"test_loss={fold_result['test_loss']:.4f} | "
@@ -752,6 +966,7 @@ def run_cross_validation(root_dir, device, args):
             f"test_accframe={fold_result['test_accframe']:.4f} | "
             f"test_accclass={fold_result['test_accclass']:.4f} | "
             f"test_change_f1={fold_result['test_change_f1']:.4f}"
+            f"{paper_metric_text}"
         )
 
     mean_test_loss = np.mean([r["test_loss"] for r in all_results])
@@ -766,11 +981,18 @@ def run_cross_validation(root_dir, device, args):
     std_test_accclass = np.std([r["test_accclass"] for r in all_results])
     mean_test_change_f1 = np.mean([r["test_change_f1"] for r in all_results])
     std_test_change_f1 = np.std([r["test_change_f1"] for r in all_results])
+    full_chord_results = [r for r in all_results if r["label_mode"] == "full_chord"]
 
     print("\n" + "=" * 80)
     print("Cross-validation summary")
     print("=" * 80)
     for r in all_results:
+        paper_metric_text = ""
+        if r["label_mode"] == "full_chord":
+            paper_metric_text = (
+                f", test_root={r['test_paper_root']:.4f}, "
+                f"test_mirex_proxy={r['test_accframe']:.4f}"
+            )
         print(
             f"{r['fold_file']}: "
             f"test_loss={r['test_loss']:.4f}, "
@@ -779,6 +1001,7 @@ def run_cross_validation(root_dir, device, args):
             f"test_accframe={r['test_accframe']:.4f}, "
             f"test_accclass={r['test_accclass']:.4f}, "
             f"test_change_f1={r['test_change_f1']:.4f}"
+            f"{paper_metric_text}"
         )
 
     print("-" * 80)
@@ -788,9 +1011,23 @@ def run_cross_validation(root_dir, device, args):
     print(f"mean_test_accframe        = {mean_test_accframe:.4f} ± {std_test_accframe:.4f}")
     print(f"mean_test_accclass        = {mean_test_accclass:.4f} ± {std_test_accclass:.4f}")
     print(f"mean_test_change_f1       = {mean_test_change_f1:.4f} ± {std_test_change_f1:.4f}")
-    if args.paper_compare:
+    if full_chord_results:
+        for key, label in (
+            ("test_paper_root", "mean_test_root"),
+            ("test_paper_thirds", "mean_test_thirds"),
+            ("test_paper_majmin", "mean_test_majmin"),
+            ("test_paper_triads", "mean_test_triads"),
+            ("test_paper_sevenths", "mean_test_sevenths"),
+            ("test_paper_tetrads", "mean_test_tetrads"),
+        ):
+            values = np.array([r[key] for r in full_chord_results], dtype=np.float64)
+            print(f"{label:<27}= {values.mean():.4f} ± {values.std():.4f}")
+    if args.paper_compare and full_chord_results:
         print("-" * 80)
         print("ChordFormer Table III no-reweight reference: accframe=0.7877, accclass=0.3884")
         print("CNN+BLSTM Table III no-reweight reference: accframe=0.7676, accclass=0.3315")
+    elif args.paper_compare:
+        print("-" * 80)
+        print("Quality27 run: Table II/Table III comparison requires --label_mode full_chord.")
 
     return all_results

@@ -47,6 +47,7 @@ class ProcessedChordConfig:
     batch_size: int = 8
     num_workers: int = 0
     window_mode: str = "sliding"
+    label_mode: str = "quality27"
     augment_train: bool = False
     noise_std: float = 0.01
     gain_min: float = 0.9
@@ -61,10 +62,11 @@ class ProcessedChordConfig:
 
 
 class ChordVocab:
-    def __init__(self, labels: List[str]):
+    def __init__(self, labels: List[str], label_mode: str = "full_chord"):
         uniq = sorted(set(labels))
         if "N" not in uniq:
             uniq.append("N")
+        self.label_mode = label_mode
         self.idx_to_chord = uniq
         self.chord_to_idx = {c: i for i, c in enumerate(uniq)}
 
@@ -81,6 +83,7 @@ class ChordVocab:
 
 class FixedChordVocab:
     def __init__(self):
+        self.label_mode = "quality27"
         self.idx_to_chord = TARGET_CLASSES
         self.chord_to_idx = {c: i for i, c in enumerate(self.idx_to_chord)}
 
@@ -93,6 +96,76 @@ class FixedChordVocab:
     @property
     def size(self):
         return len(self.idx_to_chord)
+
+
+ROOT_TO_CANONICAL = {
+    "C": "C",
+    "B#": "C",
+    "C#": "C#",
+    "DB": "C#",
+    "D": "D",
+    "D#": "D#",
+    "EB": "D#",
+    "E": "E",
+    "FB": "E",
+    "E#": "F",
+    "F": "F",
+    "F#": "F#",
+    "GB": "F#",
+    "G": "G",
+    "G#": "G#",
+    "AB": "G#",
+    "A": "A",
+    "A#": "A#",
+    "BB": "A#",
+    "B": "B",
+    "CB": "B",
+}
+
+CANONICAL_ROOTS = [
+    "C",
+    "C#",
+    "D",
+    "D#",
+    "E",
+    "F",
+    "F#",
+    "G",
+    "G#",
+    "A",
+    "A#",
+    "B",
+]
+FULL_CHORD_QUALITIES = [q for q in TARGET_CLASSES if q not in {"Others", "N"}]
+
+
+def canonicalize_root(root: str) -> str | None:
+    return ROOT_TO_CANONICAL.get(root.strip().upper())
+
+
+def normalize_quality(quality: str | None) -> str:
+    if quality is None:
+        return "maj"
+
+    quality = str(quality).strip().replace(" ", "")
+    if quality == "":
+        return "maj"
+    if quality in TARGET_CLASSES and quality not in {"N", "Others"}:
+        return quality
+
+    if quality == "maj6":
+        return "maj"
+    if quality == "min6":
+        return "min"
+    if quality == "maj6/9":
+        return "maj9"
+    if quality == "min6/9":
+        return "min9"
+    if quality == "minmaj7":
+        return "min7"
+
+    return "Others"
+
 
 def chord_label_to_quality(label: str | None) -> str:
     if label is None:
@@ -109,25 +182,30 @@ def chord_label_to_quality(label: str | None) -> str:
         return "Others"
 
     _, quality = label.split(":", 1)
-    quality = quality.strip().replace(" ", "")
+    return normalize_quality(quality)
 
-    # exact supported classes
-    if quality in TARGET_CLASSES:
-        return quality
 
-    # optional soft mappings
-    if quality == "maj6":
-        return "maj"
-    if quality == "min6":
-        return "min"
-    if quality == "maj6/9":
-        return "maj9"
-    if quality == "min6/9":
-        return "min9"
-    if quality == "minmaj7":
-        return "min7"
+def chord_label_to_full_chord(label: str | None) -> str:
+    if label is None:
+        return "N"
 
-    return "Others"
+    label = str(label).strip()
+    if label == "" or label.upper() == "N":
+        return "N"
+
+    if ":" not in label:
+        root = canonicalize_root(label)
+        return f"{root}:maj" if root is not None else "N"
+
+    root_raw, quality_raw = label.split(":", 1)
+    root = canonicalize_root(root_raw)
+    if root is None:
+        return "N"
+
+    quality = normalize_quality(quality_raw)
+    if quality in {"N", "Others"}:
+        return "N"
+    return f"{root}:{quality}"
 
 
 def _looks_like_root_label(label: str) -> bool:
@@ -187,6 +265,7 @@ def slice_into_windows(
     x: np.ndarray,             # [T, F]
     chord_targets: np.ndarray, # [T]
     chord_change_targets: np.ndarray, # [T]
+    chord_label_strings: List[str],
     n_steps: int,
     stride: int,
 ):
@@ -207,6 +286,7 @@ def slice_into_windows(
             "x": x_pad.astype(np.float32),
             "chord_targets": chord_pad.astype(np.int64),
             "chord_change_targets": change_pad.astype(np.int64),
+            "chord_label_strings": chord_label_strings + ["N"] * pad_len,
             "mask": mask,
         })
         return items
@@ -217,6 +297,7 @@ def slice_into_windows(
             "x": x[start:end].astype(np.float32),
             "chord_targets": chord_targets[start:end].astype(np.int64),
             "chord_change_targets": chord_change_targets[start:end].astype(np.int64),
+            "chord_label_strings": chord_label_strings[start:end],
             "mask": np.ones(n_steps, dtype=np.float32),
         })
 
@@ -227,6 +308,7 @@ def slice_into_windows(
             "x": x[start:end].astype(np.float32),
             "chord_targets": chord_targets[start:end].astype(np.int64),
             "chord_change_targets": chord_change_targets[start:end].astype(np.int64),
+            "chord_label_strings": chord_label_strings[start:end],
             "mask": np.ones(n_steps, dtype=np.float32),
         })
 
@@ -237,11 +319,13 @@ def make_song_item(
     x: np.ndarray,
     chord_targets: np.ndarray,
     chord_change_targets: np.ndarray,
+    chord_label_strings: List[str],
 ):
     return {
         "x": x.astype(np.float32),
         "chord_targets": chord_targets.astype(np.int64),
         "chord_change_targets": chord_change_targets.astype(np.int64),
+        "chord_label_strings": chord_label_strings,
     }
 
 
@@ -355,6 +439,7 @@ class RandomSongSegmentDataset(Dataset):
             "x": x_out.astype(np.float32),
             "chord_targets": chord_out.astype(np.int64),
             "chord_change_targets": change_out.astype(np.int64),
+            "chord_label_strings": item["chord_label_strings"][:n_steps] if total_frames <= n_steps else item["chord_label_strings"][start:end],
             "mask": mask,
         }
 
@@ -364,7 +449,15 @@ class RandomSongSegmentDataset(Dataset):
         return sample
 
 
-def build_vocab_from_train_ids(root_dir: str, train_ids: List[str]) -> ChordVocab:
+def label_to_target(label: str, label_mode: str) -> str:
+    if label_mode == "quality27":
+        return chord_label_to_quality(label)
+    if label_mode == "full_chord":
+        return chord_label_to_full_chord(label)
+    raise ValueError(f"Unsupported label_mode: {label_mode}")
+
+
+def build_vocab_from_train_ids(root_dir: str, train_ids: List[str], label_mode: str) -> ChordVocab:
     all_labels = []
 
     for track_id in train_ids:
@@ -374,9 +467,19 @@ def build_vocab_from_train_ids(root_dir: str, train_ids: List[str]) -> ChordVoca
 
         data = np.load(npz_path, allow_pickle=True)
         labels = [str(x) for x in data["labels"].tolist()]
-        all_labels.extend(labels)
+        all_labels.extend(label_to_target(lbl, label_mode) for lbl in labels)
 
-    return ChordVocab(all_labels)
+    return ChordVocab(all_labels, label_mode=label_mode)
+
+
+def build_full_chord_vocab() -> ChordVocab:
+    labels = [
+        f"{root}:{quality}"
+        for root in CANONICAL_ROOTS
+        for quality in FULL_CHORD_QUALITIES
+    ]
+    labels.append("N")
+    return ChordVocab(labels, label_mode="full_chord")
 
 
 def build_items_from_ids(
@@ -399,8 +502,8 @@ def build_items_from_ids(
         x = sample["x"]  # [T, F]
         raw_label_strings = sample["labels"]
 
-        quality_labels = [chord_label_to_quality(lbl) for lbl in raw_label_strings]
-        chord_targets = np.array([vocab.encode(lbl) for lbl in quality_labels], dtype=np.int64)
+        target_labels = [label_to_target(lbl, cfg.label_mode) for lbl in raw_label_strings]
+        chord_targets = np.array([vocab.encode(lbl) for lbl in target_labels], dtype=np.int64)
         chord_change_targets = make_chord_change_targets(chord_targets)
 
         if mode == "random_song":
@@ -409,6 +512,7 @@ def build_items_from_ids(
                     x=x,
                     chord_targets=chord_targets,
                     chord_change_targets=chord_change_targets,
+                    chord_label_strings=target_labels,
                 )
             )
         elif mode == "sliding":
@@ -417,6 +521,7 @@ def build_items_from_ids(
                     x=x,
                     chord_targets=chord_targets,
                     chord_change_targets=chord_change_targets,
+                    chord_label_strings=target_labels,
                     n_steps=cfg.n_steps,
                     stride=cfg.stride,
                 )
@@ -430,7 +535,12 @@ def build_items_from_ids(
 def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
     train_ids, val_ids, test_ids = load_fold_split(fold_json_path)
 
-    vocab = FixedChordVocab()
+    if cfg.label_mode == "quality27":
+        vocab = FixedChordVocab()
+    elif cfg.label_mode == "full_chord":
+        vocab = build_full_chord_vocab()
+    else:
+        raise ValueError(f"Unsupported label_mode: {cfg.label_mode}")
 
     train_items = build_items_from_ids(cfg.root_dir, train_ids, vocab, cfg, window_mode=cfg.window_mode)
     val_items = build_items_from_ids(cfg.root_dir, val_ids, vocab, cfg, window_mode="sliding")

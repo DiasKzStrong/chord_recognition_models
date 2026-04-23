@@ -23,6 +23,8 @@ def get_args():
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--window_mode', type=str, default="sliding", choices=["sliding", "random_song"],
                         help="sliding uses overlapping windows; random_song samples one random segment per train song per epoch.")
+    parser.add_argument('--label_mode', type=str, default="quality27", choices=["quality27", "full_chord"],
+                        help="quality27 predicts rootless chord qualities; full_chord predicts root+quality labels.")
     parser.add_argument('--embed_size', type=int, default=256)
     parser.add_argument('--n_layers', type=int, default=4)
     parser.add_argument('--n_heads', type=int, default=8)

@@ -661,3 +661,69 @@ class HTv2ChordModel(nn.Module):
         chord_logits = self.chord_classifier(out["dec_output"])  # [B, T, n_chords]
         out["chord_logits"] = chord_logits
         return out
+
+
+class StructuredHTv2ChordModel(nn.Module):
+    """
+    HTv2 backbone with six structured chord-component heads.
+
+    The model predicts root+triad, bass, seventh, ninth, eleventh, and
+    thirteenth components. Frame-level full-chord scores are decoded by
+    summing component log-probabilities over the fixed legal chord vocabulary.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        component_sizes: Dict[str, int],
+        chord_component_ids,
+        hyperparameters: HyperParameters,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.backbone = HTv2(
+            input_dim=input_dim,
+            hyperparameters=hyperparameters,
+            dropout_rate=dropout_rate,
+        )
+        self.component_names = list(component_sizes.keys())
+        self.component_heads = nn.ModuleDict({
+            name: nn.Linear(hyperparameters.input_embed_size, size)
+            for name, size in component_sizes.items()
+        })
+
+        chord_component_ids = torch.as_tensor(chord_component_ids, dtype=torch.long)
+        self.register_buffer("chord_component_ids", chord_component_ids, persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+        slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
+    ) -> Dict[str, torch.Tensor]:
+        out = self.backbone(
+            x=x,
+            source_mask=source_mask,
+            target_mask=target_mask,
+            slope=slope,
+            chord_change_targets=chord_change_targets,
+            boundary_teacher_forcing_prob=boundary_teacher_forcing_prob,
+        )
+
+        component_logits = {
+            name: self.component_heads[name](out["dec_output"])
+            for name in self.component_names
+        }
+
+        chord_scores = None
+        for component_idx, name in enumerate(self.component_names):
+            log_probs = F.log_softmax(component_logits[name], dim=-1)
+            chord_component_ids = self.chord_component_ids[:, component_idx]
+            component_scores = log_probs.index_select(dim=-1, index=chord_component_ids)
+            chord_scores = component_scores if chord_scores is None else chord_scores + component_scores
+
+        out["component_logits"] = component_logits
+        out["chord_logits"] = chord_scores
+        return out

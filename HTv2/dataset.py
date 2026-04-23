@@ -3,6 +3,7 @@ import json
 from dataclasses import dataclass
 from typing import Dict, List
 import random
+import re
 
 import numpy as np
 import torch
@@ -137,6 +138,27 @@ CANONICAL_ROOTS = [
     "B",
 ]
 FULL_CHORD_QUALITIES = [q for q in TARGET_CLASSES if q not in {"Others", "N"}]
+TRIAD_TYPES = ["maj", "min", "dim", "aug", "sus4", "sus2"]
+STRUCTURED_COMPONENT_NAMES = [
+    "root_triad",
+    "bass",
+    "seventh",
+    "ninth",
+    "eleventh",
+    "thirteenth",
+]
+STRUCTURED_COMPONENT_LABELS = {
+    "root_triad": ["N"] + [
+        f"{root}:{triad}"
+        for root in CANONICAL_ROOTS
+        for triad in TRIAD_TYPES
+    ],
+    "bass": ["N", "root", "/2", "/b3", "/3", "/4", "/5", "/6", "/b7"],
+    "seventh": ["N", "none", "+7", "+b7", "+bb7"],
+    "ninth": ["N", "none", "+9", "+#9", "+b9"],
+    "eleventh": ["N", "none", "+11", "+#11"],
+    "thirteenth": ["N", "none", "+13", "+b13"],
+}
 
 
 def canonicalize_root(root: str) -> str | None:
@@ -148,10 +170,62 @@ def normalize_quality(quality: str | None) -> str:
         return "maj"
 
     quality = str(quality).strip().replace(" ", "")
+    quality = quality.replace("*", "")
     if quality == "":
+        return "maj"
+    if quality in {"1", "1/1"}:
+        return "maj"
+    if quality.startswith("5"):
         return "maj"
     if quality in TARGET_CLASSES and quality not in {"N", "Others"}:
         return quality
+
+    base = re.sub(r"\([^)]*\)", "", quality)
+    if "/" in base:
+        base_no_bass = base.split("/", 1)[0]
+    else:
+        base_no_bass = base
+
+    if quality.startswith("maj(9)") or quality.startswith("maj9"):
+        return "maj9"
+    if quality.startswith("min(9)") or quality.startswith("min9"):
+        return "min9"
+    if quality.startswith("7(") or quality.startswith("7/"):
+        return "9" if "9" in quality else "7"
+    if quality.startswith("maj7"):
+        return "maj7"
+    if quality.startswith("min7"):
+        return "min7"
+    if quality.startswith("sus4(b7") or quality.startswith("sus4/b7"):
+        return "sus4(b7)"
+    if quality.startswith("sus4"):
+        return "sus4"
+    if quality.startswith("sus2"):
+        return "sus2"
+    if quality.startswith("dim7"):
+        return "dim7"
+    if quality.startswith("hdim7"):
+        return "hdim7"
+    if quality.startswith("dim/b7"):
+        return "dim7"
+    if quality.startswith("dim"):
+        return "dim"
+    if quality.startswith("aug"):
+        return "aug"
+    if quality.startswith("min11"):
+        return "min9"
+    if quality.startswith("min6"):
+        return "min"
+    if quality.startswith("maj6"):
+        return "maj"
+    if quality.startswith("maj"):
+        mapped_bass = _map_bass_marker(base)
+        return f"maj{mapped_bass}" if mapped_bass else "maj"
+    if quality.startswith("min"):
+        mapped_bass = _map_bass_marker(base)
+        return f"min{mapped_bass}" if mapped_bass else "min"
+    if base_no_bass in TARGET_CLASSES and base_no_bass not in {"N", "Others"}:
+        return base_no_bass
 
     if quality == "maj6":
         return "maj"
@@ -165,6 +239,15 @@ def normalize_quality(quality: str | None) -> str:
         return "min7"
 
     return "Others"
+
+
+def _map_bass_marker(quality: str) -> str | None:
+    if "/" not in quality:
+        return None
+    bass = quality.split("/", 1)[1]
+    if bass in {"2", "b3", "3", "5", "b7"}:
+        return f"/{bass}"
+    return None
 
 
 def chord_label_to_quality(label: str | None) -> str:
@@ -194,6 +277,11 @@ def chord_label_to_full_chord(label: str | None) -> str:
         return "N"
 
     if ":" not in label:
+        if "/" in label:
+            root_raw, bass_raw = label.split("/", 1)
+            root = canonicalize_root(root_raw)
+            if root is not None and bass_raw in {"2", "b3", "3", "5", "b7"}:
+                return f"{root}:maj/{bass_raw}"
         root = canonicalize_root(label)
         return f"{root}:maj" if root is not None else "N"
 
@@ -206,6 +294,74 @@ def chord_label_to_full_chord(label: str | None) -> str:
     if quality in {"N", "Others"}:
         return "N"
     return f"{root}:{quality}"
+
+
+def full_chord_to_components(label: str | None) -> List[str]:
+    label = chord_label_to_full_chord(label)
+    if label == "N":
+        return ["N", "N", "N", "N", "N", "N"]
+
+    root, quality = label.split(":", 1)
+
+    triad = "maj"
+    bass = "root"
+    seventh = "none"
+    ninth = "none"
+    eleventh = "none"
+    thirteenth = "none"
+
+    if quality.startswith("min"):
+        triad = "min"
+    elif quality.startswith("dim") or quality == "hdim7":
+        triad = "dim"
+    elif quality == "aug":
+        triad = "aug"
+    elif quality.startswith("sus4"):
+        triad = "sus4"
+    elif quality.startswith("sus2"):
+        triad = "sus2"
+
+    bass_markers = {
+        "maj/2": "/2",
+        "min/2": "/2",
+        "min/b3": "/b3",
+        "maj/3": "/3",
+        "maj/5": "/5",
+        "min/5": "/5",
+        "maj/b7": "/b7",
+        "min/b7": "/b7",
+    }
+    bass = bass_markers.get(quality, "root")
+
+    if quality == "maj7":
+        seventh = "+7"
+    elif quality in {"7", "9", "11", "13", "min7", "min9", "sus4(b7)", "hdim7"}:
+        seventh = "+b7"
+    elif quality == "dim7":
+        seventh = "+bb7"
+
+    if quality in {"9", "maj9", "min9", "11", "13"}:
+        ninth = "+9"
+    if quality in {"11", "13"}:
+        eleventh = "+11"
+    if quality == "13":
+        thirteenth = "+13"
+
+    return [
+        f"{root}:{triad}",
+        bass,
+        seventh,
+        ninth,
+        eleventh,
+        thirteenth,
+    ]
+
+
+def build_structured_component_vocabs():
+    return {
+        name: {label: idx for idx, label in enumerate(labels)}
+        for name, labels in STRUCTURED_COMPONENT_LABELS.items()
+    }
 
 
 def _looks_like_root_label(label: str) -> bool:
@@ -266,6 +422,7 @@ def slice_into_windows(
     chord_targets: np.ndarray, # [T]
     chord_change_targets: np.ndarray, # [T]
     chord_label_strings: List[str],
+    component_targets: np.ndarray | None,
     n_steps: int,
     stride: int,
 ):
@@ -278,39 +435,57 @@ def slice_into_windows(
         x_pad = np.pad(x, ((0, pad_len), (0, 0)), mode="constant")
         chord_pad = np.pad(chord_targets, (0, pad_len), mode="constant", constant_values=0)
         change_pad = np.pad(chord_change_targets, (0, pad_len), mode="constant", constant_values=0)
+        if component_targets is not None:
+            component_pad = np.pad(
+                component_targets,
+                ((0, pad_len), (0, 0)),
+                mode="constant",
+                constant_values=0,
+            )
+        else:
+            component_pad = None
 
         mask = np.zeros(n_steps, dtype=np.float32)
         mask[:total_frames] = 1.0
 
-        items.append({
+        item = {
             "x": x_pad.astype(np.float32),
             "chord_targets": chord_pad.astype(np.int64),
             "chord_change_targets": change_pad.astype(np.int64),
             "chord_label_strings": chord_label_strings + ["N"] * pad_len,
             "mask": mask,
-        })
+        }
+        if component_pad is not None:
+            item["component_targets"] = component_pad.astype(np.int64)
+        items.append(item)
         return items
 
     for start in range(0, total_frames - n_steps + 1, stride):
         end = start + n_steps
-        items.append({
+        item = {
             "x": x[start:end].astype(np.float32),
             "chord_targets": chord_targets[start:end].astype(np.int64),
             "chord_change_targets": chord_change_targets[start:end].astype(np.int64),
             "chord_label_strings": chord_label_strings[start:end],
             "mask": np.ones(n_steps, dtype=np.float32),
-        })
+        }
+        if component_targets is not None:
+            item["component_targets"] = component_targets[start:end].astype(np.int64)
+        items.append(item)
 
     if (total_frames - n_steps) % stride != 0:
         start = total_frames - n_steps
         end = total_frames
-        items.append({
+        item = {
             "x": x[start:end].astype(np.float32),
             "chord_targets": chord_targets[start:end].astype(np.int64),
             "chord_change_targets": chord_change_targets[start:end].astype(np.int64),
             "chord_label_strings": chord_label_strings[start:end],
             "mask": np.ones(n_steps, dtype=np.float32),
-        })
+        }
+        if component_targets is not None:
+            item["component_targets"] = component_targets[start:end].astype(np.int64)
+        items.append(item)
 
     return items
 
@@ -320,13 +495,17 @@ def make_song_item(
     chord_targets: np.ndarray,
     chord_change_targets: np.ndarray,
     chord_label_strings: List[str],
+    component_targets: np.ndarray | None,
 ):
-    return {
+    item = {
         "x": x.astype(np.float32),
         "chord_targets": chord_targets.astype(np.int64),
         "chord_change_targets": chord_change_targets.astype(np.int64),
         "chord_label_strings": chord_label_strings,
     }
+    if component_targets is not None:
+        item["component_targets"] = component_targets.astype(np.int64)
+    return item
 
 
 class ProcessedChordDataset(Dataset):
@@ -396,12 +575,15 @@ class ProcessedChordDataset(Dataset):
         if self.augment:
             x = self._augment_x(x)
 
-        return {
+        sample = {
             "x": x,
             "chord_targets": torch.tensor(item["chord_targets"], dtype=torch.long),
             "chord_change_targets": torch.tensor(item["chord_change_targets"], dtype=torch.long),
             "mask": torch.tensor(item["mask"], dtype=torch.float32),
         }
+        if "component_targets" in item:
+            sample["component_targets"] = torch.tensor(item["component_targets"], dtype=torch.long)
+        return sample
 
 
 class RandomSongSegmentDataset(Dataset):
@@ -417,6 +599,7 @@ class RandomSongSegmentDataset(Dataset):
         x = item["x"]
         chord_targets = item["chord_targets"]
         chord_change_targets = item["chord_change_targets"]
+        component_targets = item.get("component_targets")
         total_frames = x.shape[0]
         n_steps = self.cfg.n_steps
 
@@ -425,23 +608,38 @@ class RandomSongSegmentDataset(Dataset):
             x_out = np.pad(x, ((0, pad_len), (0, 0)), mode="constant")
             chord_out = np.pad(chord_targets, (0, pad_len), mode="constant", constant_values=0)
             change_out = np.pad(chord_change_targets, (0, pad_len), mode="constant", constant_values=0)
+            if component_targets is not None:
+                component_out = np.pad(
+                    component_targets,
+                    ((0, pad_len), (0, 0)),
+                    mode="constant",
+                    constant_values=0,
+                )
+            else:
+                component_out = None
             mask = np.zeros(n_steps, dtype=np.float32)
             mask[:total_frames] = 1.0
+            label_strings = item["chord_label_strings"][:total_frames] + ["N"] * pad_len
         else:
             start = random.randint(0, total_frames - n_steps)
             end = start + n_steps
             x_out = x[start:end]
             chord_out = chord_targets[start:end]
             change_out = chord_change_targets[start:end]
+            component_out = component_targets[start:end] if component_targets is not None else None
             mask = np.ones(n_steps, dtype=np.float32)
+            label_strings = item["chord_label_strings"][start:end]
 
-        return {
+        out = {
             "x": x_out.astype(np.float32),
             "chord_targets": chord_out.astype(np.int64),
             "chord_change_targets": change_out.astype(np.int64),
-            "chord_label_strings": item["chord_label_strings"][:n_steps] if total_frames <= n_steps else item["chord_label_strings"][start:end],
+            "chord_label_strings": label_strings,
             "mask": mask,
         }
+        if component_out is not None:
+            out["component_targets"] = component_out.astype(np.int64)
+        return out
 
     def __getitem__(self, idx):
         item = self._slice_song(self.songs[idx])
@@ -452,7 +650,7 @@ class RandomSongSegmentDataset(Dataset):
 def label_to_target(label: str, label_mode: str) -> str:
     if label_mode == "quality27":
         return chord_label_to_quality(label)
-    if label_mode == "full_chord":
+    if label_mode in {"full_chord", "structured_full_chord"}:
         return chord_label_to_full_chord(label)
     raise ValueError(f"Unsupported label_mode: {label_mode}")
 
@@ -472,14 +670,43 @@ def build_vocab_from_train_ids(root_dir: str, train_ids: List[str], label_mode: 
     return ChordVocab(all_labels, label_mode=label_mode)
 
 
-def build_full_chord_vocab() -> ChordVocab:
+def attach_structured_metadata(vocab: ChordVocab) -> ChordVocab:
+    component_vocabs = build_structured_component_vocabs()
+    component_ids = []
+    for chord in vocab.idx_to_chord:
+        components = full_chord_to_components(chord)
+        component_ids.append([
+            component_vocabs[name][component]
+            for name, component in zip(STRUCTURED_COMPONENT_NAMES, components)
+        ])
+
+    vocab.component_names = STRUCTURED_COMPONENT_NAMES
+    vocab.component_labels = STRUCTURED_COMPONENT_LABELS
+    vocab.component_to_idx = component_vocabs
+    vocab.chord_component_ids = np.array(component_ids, dtype=np.int64)
+    return vocab
+
+
+def build_full_chord_vocab(label_mode: str = "full_chord") -> ChordVocab:
     labels = [
         f"{root}:{quality}"
         for root in CANONICAL_ROOTS
         for quality in FULL_CHORD_QUALITIES
     ]
     labels.append("N")
-    return ChordVocab(labels, label_mode="full_chord")
+    vocab = ChordVocab(labels, label_mode=label_mode)
+    return attach_structured_metadata(vocab)
+
+
+def encode_component_targets(labels: List[str], vocab: ChordVocab) -> np.ndarray:
+    rows = []
+    for label in labels:
+        components = full_chord_to_components(label)
+        rows.append([
+            vocab.component_to_idx[name][component]
+            for name, component in zip(vocab.component_names, components)
+        ])
+    return np.array(rows, dtype=np.int64)
 
 
 def build_items_from_ids(
@@ -505,6 +732,9 @@ def build_items_from_ids(
         target_labels = [label_to_target(lbl, cfg.label_mode) for lbl in raw_label_strings]
         chord_targets = np.array([vocab.encode(lbl) for lbl in target_labels], dtype=np.int64)
         chord_change_targets = make_chord_change_targets(chord_targets)
+        component_targets = None
+        if cfg.label_mode == "structured_full_chord":
+            component_targets = encode_component_targets(target_labels, vocab)
 
         if mode == "random_song":
             items.append(
@@ -513,6 +743,7 @@ def build_items_from_ids(
                     chord_targets=chord_targets,
                     chord_change_targets=chord_change_targets,
                     chord_label_strings=target_labels,
+                    component_targets=component_targets,
                 )
             )
         elif mode == "sliding":
@@ -522,6 +753,7 @@ def build_items_from_ids(
                     chord_targets=chord_targets,
                     chord_change_targets=chord_change_targets,
                     chord_label_strings=target_labels,
+                    component_targets=component_targets,
                     n_steps=cfg.n_steps,
                     stride=cfg.stride,
                 )
@@ -537,8 +769,8 @@ def build_processed_loaders(cfg: ProcessedChordConfig, fold_json_path: str):
 
     if cfg.label_mode == "quality27":
         vocab = FixedChordVocab()
-    elif cfg.label_mode == "full_chord":
-        vocab = build_full_chord_vocab()
+    elif cfg.label_mode in {"full_chord", "structured_full_chord"}:
+        vocab = build_full_chord_vocab(label_mode=cfg.label_mode)
     else:
         raise ValueError(f"Unsupported label_mode: {cfg.label_mode}")
 

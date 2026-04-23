@@ -60,19 +60,41 @@ def compute_losses(
     chord_targets: torch.Tensor,
     chord_change_targets: torch.Tensor,
     mask: torch.Tensor,
+    component_targets: Optional[torch.Tensor] = None,
     chord_loss_weight: float = 1.0,
     change_loss_weight: float = 1.0,
     change_pos_weight: Optional[torch.Tensor] = None,
     chord_class_weights: Optional[torch.Tensor] = None,
+    component_class_weights: Optional[Dict[str, torch.Tensor]] = None,
     label_smoothing: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
-    chord_loss = masked_cross_entropy(
-        logits=outputs["chord_logits"],
-        targets=chord_targets,
-        mask=mask,
-        class_weights=chord_class_weights,
-        label_smoothing=label_smoothing,
-    )
+    if "component_logits" in outputs:
+        if component_targets is None:
+            raise ValueError("component_targets are required for structured chord training")
+
+        component_losses = []
+        for component_idx, (name, logits) in enumerate(outputs["component_logits"].items()):
+            weights = None
+            if component_class_weights is not None:
+                weights = component_class_weights.get(name)
+            component_losses.append(
+                masked_cross_entropy(
+                    logits=logits,
+                    targets=component_targets[:, :, component_idx],
+                    mask=mask,
+                    class_weights=weights,
+                    label_smoothing=label_smoothing,
+                )
+            )
+        chord_loss = torch.stack(component_losses).mean()
+    else:
+        chord_loss = masked_cross_entropy(
+            logits=outputs["chord_logits"],
+            targets=chord_targets,
+            mask=mask,
+            class_weights=chord_class_weights,
+            label_smoothing=label_smoothing,
+        )
 
     change_loss = masked_bce_with_logits(
         logits=outputs["chord_change_logits"],
@@ -348,6 +370,7 @@ def train_step(
     grad_clip: Optional[float] = None,
     change_pos_weight: Optional[torch.Tensor] = None,
     chord_class_weights: Optional[torch.Tensor] = None,
+    component_class_weights: Optional[Dict[str, torch.Tensor]] = None,
     label_smoothing: float = 0.0,
     boundary_teacher_forcing_prob: float = 0.0,
 ):
@@ -358,6 +381,9 @@ def train_step(
     chord_targets = batch["chord_targets"].to(device)
     chord_change_targets = batch["chord_change_targets"].to(device)
     mask = batch["mask"].to(device)
+    component_targets = batch.get("component_targets")
+    if component_targets is not None:
+        component_targets = component_targets.to(device)
 
     outputs = model(
         x=x,
@@ -373,10 +399,15 @@ def train_step(
         chord_targets=chord_targets,
         chord_change_targets=chord_change_targets,
         mask=mask,
+        component_targets=component_targets,
         chord_loss_weight=chord_loss_weight,
         change_loss_weight=change_loss_weight,
         change_pos_weight=change_pos_weight.to(device) if change_pos_weight is not None else None,
         chord_class_weights=chord_class_weights.to(device) if chord_class_weights is not None else None,
+        component_class_weights={
+            name: weight.to(device)
+            for name, weight in component_class_weights.items()
+        } if component_class_weights is not None else None,
         label_smoothing=label_smoothing,
     )
 
@@ -389,7 +420,7 @@ def train_step(
 
     with torch.no_grad():
         counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, vocab.size)
-        if getattr(vocab, "label_mode", "") == "full_chord":
+        if getattr(vocab, "label_mode", "") in {"full_chord", "structured_full_chord"}:
             counts.update(
                 full_chord_metric_counts(
                     pred_ids=outputs["chord_logits"].argmax(dim=-1),
@@ -418,6 +449,7 @@ def eval_step(
     change_loss_weight: float = 1.0,
     change_pos_weight: Optional[torch.Tensor] = None,
     chord_class_weights: Optional[torch.Tensor] = None,
+    component_class_weights: Optional[Dict[str, torch.Tensor]] = None,
     label_smoothing: float = 0.0,
 ):
     model.eval()
@@ -426,6 +458,9 @@ def eval_step(
     chord_targets = batch["chord_targets"].to(device)
     chord_change_targets = batch["chord_change_targets"].to(device)
     mask = batch["mask"].to(device)
+    component_targets = batch.get("component_targets")
+    if component_targets is not None:
+        component_targets = component_targets.to(device)
 
     outputs = model(
         x=x,
@@ -439,15 +474,20 @@ def eval_step(
         chord_targets=chord_targets,
         chord_change_targets=chord_change_targets,
         mask=mask,
+        component_targets=component_targets,
         chord_loss_weight=chord_loss_weight,
         change_loss_weight=change_loss_weight,
         change_pos_weight=change_pos_weight.to(device) if change_pos_weight is not None else None,
         chord_class_weights=chord_class_weights.to(device) if chord_class_weights is not None else None,
+        component_class_weights={
+            name: weight.to(device)
+            for name, weight in component_class_weights.items()
+        } if component_class_weights is not None else None,
         label_smoothing=label_smoothing,
     )
 
     counts = _metric_counts(outputs, chord_targets, chord_change_targets, mask, vocab.size)
-    if getattr(vocab, "label_mode", "") == "full_chord":
+    if getattr(vocab, "label_mode", "") in {"full_chord", "structured_full_chord"}:
         counts.update(
             full_chord_metric_counts(
                 pred_ids=outputs["chord_logits"].argmax(dim=-1),
@@ -476,6 +516,7 @@ def train_one_epoch(
     grad_clip=None,
     change_pos_weight=None,
     chord_class_weights=None,
+    component_class_weights=None,
     label_smoothing=0.0,
     boundary_teacher_forcing_prob=0.0,
 ):
@@ -498,6 +539,7 @@ def train_one_epoch(
                 grad_clip=grad_clip,
                 change_pos_weight=change_pos_weight,
                 chord_class_weights=chord_class_weights,
+                component_class_weights=component_class_weights,
                 label_smoothing=label_smoothing,
                 boundary_teacher_forcing_prob=boundary_teacher_forcing_prob,
             )
@@ -527,6 +569,7 @@ def eval_one_epoch(
     change_loss_weight=0.1,
     change_pos_weight=None,
     chord_class_weights=None,
+    component_class_weights=None,
     label_smoothing=0.0,
 ):
     state = _empty_epoch_state(vocab.size)
@@ -546,6 +589,7 @@ def eval_one_epoch(
                 change_loss_weight=change_loss_weight,
                 change_pos_weight=change_pos_weight,
                 chord_class_weights=chord_class_weights,
+                component_class_weights=component_class_weights,
                 label_smoothing=label_smoothing,
             )
             _update_epoch_state(state, metrics)
@@ -576,6 +620,12 @@ def _format_change_f1(metrics: Dict[str, object]) -> str:
 
 def compute_train_statistics(dataset, vocab):
     class_counts = np.zeros(vocab.size, dtype=np.float64)
+    component_counts = None
+    if getattr(vocab, "label_mode", "") == "structured_full_chord":
+        component_counts = {
+            name: np.zeros(len(vocab.component_labels[name]), dtype=np.float64)
+            for name in vocab.component_names
+        }
     change_pos = 0.0
     valid_total = 0.0
 
@@ -588,6 +638,13 @@ def compute_train_statistics(dataset, vocab):
         targets = item["chord_targets"][mask]
         changes = item["chord_change_targets"][mask]
         class_counts += np.bincount(targets, minlength=vocab.size)
+        if component_counts is not None and "component_targets" in item:
+            component_targets = item["component_targets"][mask]
+            for idx, name in enumerate(vocab.component_names):
+                component_counts[name] += np.bincount(
+                    component_targets[:, idx],
+                    minlength=len(vocab.component_labels[name]),
+                )
         change_pos += float(changes.sum())
         valid_total += float(mask.sum())
 
@@ -602,6 +659,7 @@ def compute_train_statistics(dataset, vocab):
         "change_pos": change_pos,
         "change_neg": valid_total - change_pos,
         "change_rate": change_rate,
+        "component_counts": component_counts,
     }
 
 
@@ -616,6 +674,17 @@ def make_class_weights(class_counts: np.ndarray, mode: str) -> Optional[torch.Te
     weights = weights / weights.mean()
     weights = np.clip(weights, 0.3, 3.0)
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def make_component_class_weights(stats, vocab, mode: str) -> Optional[Dict[str, torch.Tensor]]:
+    component_counts = stats.get("component_counts")
+    if component_counts is None or mode == "none":
+        return None
+
+    return {
+        name: make_class_weights(counts, mode)
+        for name, counts in component_counts.items()
+    }
 
 
 def make_change_pos_weight(change_pos: float, change_neg: float, max_weight: float) -> torch.Tensor:
@@ -658,11 +727,12 @@ def format_worst_classes(per_class_acc: Dict[str, float], limit: int = 6) -> str
 
 
 def print_paper_comparison(result: Dict[str, object]) -> None:
-    if result["label_mode"] == "full_chord":
+    if result["label_mode"] in {"full_chord", "structured_full_chord"}:
+        model_label = "HTv2 structured" if result["label_mode"] == "structured_full_chord" else "HTv2 flat"
         print(
             "Paper-style large-vocabulary metrics | "
-            f"HTv2 accframe={result['test_accframe']:.4f} | "
-            f"HTv2 accclass={result['test_accclass']:.4f} | "
+            f"{model_label} accframe={result['test_accframe']:.4f} | "
+            f"{model_label} accclass={result['test_accclass']:.4f} | "
             f"accclass_seen={result['test_accclass_seen']:.4f} | "
             f"vocab={result['vocab_size']} | "
             f"seen_test_classes={result['test_seen_chord_classes']}"
@@ -687,7 +757,9 @@ def print_paper_comparison(result: Dict[str, object]) -> None:
         )
         print(
             "Note: structural metrics here are lightweight proxies. Official Root/MIREX-style "
-            "scores should be computed with mir_eval from aligned chord intervals."
+            "scores should be computed with mir_eval from aligned chord intervals. "
+            "structured_full_chord uses six component heads and legal-vocabulary decoding, "
+            "but does not include the paper's CRF temporal decoder."
         )
     else:
         print(
@@ -699,7 +771,7 @@ def print_paper_comparison(result: Dict[str, object]) -> None:
         print(
             "Note: quality27 matches the 27 chord-component labels used in the paper's "
             "Figure 4 confusion matrix, but it is not comparable to Table II/Table III. "
-            "Use --label_mode full_chord for large-vocabulary comparison."
+            "Use --label_mode structured_full_chord for the closest large-vocabulary comparison."
         )
 
 
@@ -751,6 +823,10 @@ def run_one_fold(
     print_fold_data_summary(fold_name, train_dataset, val_dataset, test_dataset, stats, vocab)
 
     chord_class_weights = make_class_weights(stats["class_counts"], args.class_weighting)
+    component_class_weights = None
+    if args.label_mode == "structured_full_chord":
+        component_class_weights = make_component_class_weights(stats, vocab, args.class_weighting)
+        chord_class_weights = None
     change_pos_weight = make_change_pos_weight(
         stats["change_pos"],
         stats["change_neg"],
@@ -758,6 +834,8 @@ def run_one_fold(
     )
     if chord_class_weights is not None:
         print(f"{fold_name} class weights enabled: mode={args.class_weighting}")
+    if component_class_weights is not None:
+        print(f"{fold_name} structured component weights enabled: mode={args.class_weighting}")
     print(f"{fold_name} boundary pos_weight={change_pos_weight.item():.2f}")
 
     hp = HyperParameters(
@@ -767,12 +845,25 @@ def run_one_fold(
         n_heads=args.n_heads,
     )
 
-    model = HTv2ChordModel(
-        input_dim=input_dim,
-        n_chords=n_chords,
-        hyperparameters=hp,
-        dropout_rate=args.dropout,
-    ).to(device)
+    if args.label_mode == "structured_full_chord":
+        component_sizes = {
+            name: len(vocab.component_labels[name])
+            for name in vocab.component_names
+        }
+        model = StructuredHTv2ChordModel(
+            input_dim=input_dim,
+            component_sizes=component_sizes,
+            chord_component_ids=vocab.chord_component_ids,
+            hyperparameters=hp,
+            dropout_rate=args.dropout,
+        ).to(device)
+    else:
+        model = HTv2ChordModel(
+            input_dim=input_dim,
+            n_chords=n_chords,
+            hyperparameters=hp,
+            dropout_rate=args.dropout,
+        ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -814,6 +905,7 @@ def run_one_fold(
             grad_clip=args.grad_clip,
             change_pos_weight=change_pos_weight,
             chord_class_weights=chord_class_weights,
+            component_class_weights=component_class_weights,
             label_smoothing=args.label_smoothing,
             boundary_teacher_forcing_prob=boundary_tf_prob,
         )
@@ -828,6 +920,7 @@ def run_one_fold(
             change_loss_weight=args.change_loss_weight,
             change_pos_weight=change_pos_weight,
             chord_class_weights=chord_class_weights,
+            component_class_weights=component_class_weights,
             label_smoothing=args.label_smoothing,
         )
 
@@ -883,6 +976,7 @@ def run_one_fold(
         change_loss_weight=args.change_loss_weight,
         change_pos_weight=change_pos_weight,
         chord_class_weights=chord_class_weights,
+        component_class_weights=component_class_weights,
         label_smoothing=args.label_smoothing,
     )
     print(f"{fold_name} worst test classes: {format_worst_classes(test_metrics['per_class_acc'])}")
@@ -901,11 +995,12 @@ def run_one_fold(
         "test_accframe": test_metrics["chord_acc"],
         "test_accclass": (
             test_metrics["macro_chord_acc_all"]
-            if args.label_mode == "full_chord"
+            if args.label_mode in {"full_chord", "structured_full_chord"}
             else test_metrics["macro_chord_acc"]
         ),
         "test_accclass_seen": test_metrics["macro_chord_acc"],
         "test_seen_chord_classes": test_metrics["seen_chord_classes"],
+        "test_structured_decode": args.label_mode == "structured_full_chord",
         "test_paper_root": test_metrics["paper_root"],
         "test_paper_thirds": test_metrics["paper_thirds"],
         "test_paper_majmin": test_metrics["paper_majmin"],
@@ -952,7 +1047,7 @@ def run_cross_validation(root_dir, device, args):
         all_results.append(fold_result)
 
         paper_metric_text = ""
-        if fold_result["label_mode"] == "full_chord":
+        if fold_result["label_mode"] in {"full_chord", "structured_full_chord"}:
             paper_metric_text = (
                 f" | test_root={fold_result['test_paper_root']:.4f} | "
                 f"test_mirex_proxy={fold_result['test_accframe']:.4f}"
@@ -981,14 +1076,17 @@ def run_cross_validation(root_dir, device, args):
     std_test_accclass = np.std([r["test_accclass"] for r in all_results])
     mean_test_change_f1 = np.mean([r["test_change_f1"] for r in all_results])
     std_test_change_f1 = np.std([r["test_change_f1"] for r in all_results])
-    full_chord_results = [r for r in all_results if r["label_mode"] == "full_chord"]
+    full_chord_results = [
+        r for r in all_results
+        if r["label_mode"] in {"full_chord", "structured_full_chord"}
+    ]
 
     print("\n" + "=" * 80)
     print("Cross-validation summary")
     print("=" * 80)
     for r in all_results:
         paper_metric_text = ""
-        if r["label_mode"] == "full_chord":
+        if r["label_mode"] in {"full_chord", "structured_full_chord"}:
             paper_metric_text = (
                 f", test_root={r['test_paper_root']:.4f}, "
                 f"test_mirex_proxy={r['test_accframe']:.4f}"
@@ -1028,6 +1126,6 @@ def run_cross_validation(root_dir, device, args):
         print("CNN+BLSTM Table III no-reweight reference: accframe=0.7676, accclass=0.3315")
     elif args.paper_compare:
         print("-" * 80)
-        print("Quality27 run: Table II/Table III comparison requires --label_mode full_chord.")
+        print("Quality27 run: Table II/Table III comparison requires --label_mode structured_full_chord.")
 
     return all_results

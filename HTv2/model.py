@@ -499,6 +499,8 @@ class HTv2(nn.Module):
         source_mask: torch.Tensor,   # [B, T]
         target_mask: torch.Tensor,   # [B, T]
         slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
     ):
         hp = self.hp
         B, T, _ = x.shape
@@ -541,6 +543,17 @@ class HTv2(nn.Module):
         chord_change_prediction = chord_change_prediction.clone()
         chord_change_prediction[:, 0] = 0
 
+        regionalization_changes = chord_change_prediction
+        if (
+            self.training
+            and chord_change_targets is not None
+            and boundary_teacher_forcing_prob > 0.0
+        ):
+            use_teacher = torch.rand((), device=x.device) < boundary_teacher_forcing_prob
+            if bool(use_teacher.item()):
+                regionalization_changes = chord_change_targets.long().clone()
+                regionalization_changes[:, 0] = 0
+
         # Decoder input
         dec_input_embed = self.dec_input_proj(x)
         dec_input_embed = self.dropout(dec_input_embed)
@@ -553,7 +566,7 @@ class HTv2(nn.Module):
         # Regionalization
         dec_input_embed_reg, block_ids, num_blocks = chord_block_compression(
             dec_input_embed,
-            chord_change_prediction,
+            regionalization_changes,
             compression="mean",
         )
         dec_input_embed_reg = decode_compressed_sequences(dec_input_embed_reg, block_ids)
@@ -598,6 +611,7 @@ class HTv2(nn.Module):
             "self_attn_maps": self_attn_map_list,
             "attn_maps": attn_map_list,
             "chord_change_prediction": chord_change_prediction,
+            "regionalization_changes": regionalization_changes,
         }
 
 
@@ -632,14 +646,84 @@ class HTv2ChordModel(nn.Module):
         source_mask: torch.Tensor,
         target_mask: torch.Tensor,
         slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         out = self.backbone(
             x=x,
             source_mask=source_mask,
             target_mask=target_mask,
             slope=slope,
+            chord_change_targets=chord_change_targets,
+            boundary_teacher_forcing_prob=boundary_teacher_forcing_prob,
         )
 
         chord_logits = self.chord_classifier(out["dec_output"])  # [B, T, n_chords]
         out["chord_logits"] = chord_logits
+        return out
+
+
+class StructuredHTv2ChordModel(nn.Module):
+    """
+    HTv2 backbone with six structured chord-component heads.
+
+    The model predicts root+triad, bass, seventh, ninth, eleventh, and
+    thirteenth components. Frame-level full-chord scores are decoded by
+    summing component log-probabilities over the fixed legal chord vocabulary.
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        component_sizes: Dict[str, int],
+        chord_component_ids,
+        hyperparameters: HyperParameters,
+        dropout_rate: float = 0.1,
+    ):
+        super().__init__()
+        self.backbone = HTv2(
+            input_dim=input_dim,
+            hyperparameters=hyperparameters,
+            dropout_rate=dropout_rate,
+        )
+        self.component_names = list(component_sizes.keys())
+        self.component_heads = nn.ModuleDict({
+            name: nn.Linear(hyperparameters.input_embed_size, size)
+            for name, size in component_sizes.items()
+        })
+
+        chord_component_ids = torch.as_tensor(chord_component_ids, dtype=torch.long)
+        self.register_buffer("chord_component_ids", chord_component_ids, persistent=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        source_mask: torch.Tensor,
+        target_mask: torch.Tensor,
+        slope: float,
+        chord_change_targets: Optional[torch.Tensor] = None,
+        boundary_teacher_forcing_prob: float = 0.0,
+    ) -> Dict[str, torch.Tensor]:
+        out = self.backbone(
+            x=x,
+            source_mask=source_mask,
+            target_mask=target_mask,
+            slope=slope,
+            chord_change_targets=chord_change_targets,
+            boundary_teacher_forcing_prob=boundary_teacher_forcing_prob,
+        )
+
+        component_logits = {
+            name: self.component_heads[name](out["dec_output"])
+            for name in self.component_names
+        }
+
+        chord_scores = None
+        for component_idx, name in enumerate(self.component_names):
+            log_probs = F.log_softmax(component_logits[name], dim=-1)
+            chord_component_ids = self.chord_component_ids[:, component_idx]
+            component_scores = log_probs.index_select(dim=-1, index=chord_component_ids)
+            chord_scores = component_scores if chord_scores is None else chord_scores + component_scores
+
+        out["component_logits"] = component_logits
+        out["chord_logits"] = chord_scores
         return out

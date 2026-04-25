@@ -12,7 +12,7 @@ from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import *
-from model import *
+from models import HyperParameters, build_model
 
 
 def is_distributed() -> bool:
@@ -950,25 +950,13 @@ def run_one_fold(
         n_heads=args.n_heads,
     )
 
-    if args.label_mode == "structured_full_chord":
-        component_sizes = {
-            name: len(vocab.component_labels[name])
-            for name in vocab.component_names
-        }
-        model = StructuredHTv2ChordModel(
-            input_dim=input_dim,
-            component_sizes=component_sizes,
-            chord_component_ids=vocab.chord_component_ids,
-            hyperparameters=hp,
-            dropout_rate=args.dropout,
-        ).to(device)
-    else:
-        model = HTv2ChordModel(
-            input_dim=input_dim,
-            n_chords=n_chords,
-            hyperparameters=hp,
-            dropout_rate=args.dropout,
-        ).to(device)
+    model = build_model(
+        model_type=args.model_type,
+        input_dim=input_dim,
+        vocab=vocab,
+        hyperparameters=hp,
+        dropout_rate=args.dropout,
+    ).to(device)
 
     if is_distributed():
         if device.type == "cuda":

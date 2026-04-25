@@ -5,7 +5,7 @@ import os
 import torch.distributed as dist
 
 def get_args():
-    parser = argparse.ArgumentParser("HTv2 arguments")
+    parser = argparse.ArgumentParser("ACR arguments")
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
     parser.add_argument('--learning_rate', type=float, default=1e-4)

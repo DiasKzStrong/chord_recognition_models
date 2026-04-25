@@ -17,7 +17,6 @@ def get_args():
     parser.add_argument('--grad_clip', type=float, default=None)
     parser.add_argument('--experiment_name', type=str, default="accuracy_run",
                         help="Experiment name that you currently running")
-
     parser.add_argument('--n_steps', type=int, default=128)
     parser.add_argument('--stride', type=int, default=64)
     parser.add_argument('--batch_size', type=int, default=8)

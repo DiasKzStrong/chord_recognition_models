@@ -5,7 +5,9 @@ import os
 import torch.distributed as dist
 
 def get_args():
-    parser = argparse.ArgumentParser("HTv2 arguments")
+    parser = argparse.ArgumentParser("ACR arguments")
+    parser.add_argument('--model_type', type=str, default="htv2", choices=["htv2", "btc"],
+                        help="Backbone to train. btc uses the same output heads/objectives as HTv2, without CRF.")
     parser.add_argument('--optimizer_type', type=str, default="AdamW", choices=["AdamW"],
                         help="What optimizer to use")
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -65,7 +67,7 @@ def get_args():
     parser.add_argument('--fold_ids', type=str, default="",
                         help="Comma-separated fold ids, e.g. '0' or '0,1'. Overrides --num_folds.")
     parser.add_argument('--paper_compare', action="store_true",
-                        help="Print ChordFormer-style accframe/accclass aliases and paper reference numbers.")
+                        help="Print large-vocabulary accframe/accclass aliases and reference numbers.")
     parser.add_argument('--root_dir', type=str, default=None)
     return parser.parse_args()
 
@@ -110,7 +112,7 @@ if __name__ == "__main__":
             if distributed:
                 print(f"Distributed : world_size={world_size}")
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        root_dir = args.root_dir or os.path.join(script_dir, "chord_data_1217")
+        root_dir = args.root_dir or os.path.join(script_dir, "data", "chord_data_1217")
 
         _ = run_cross_validation(
             root_dir=root_dir,

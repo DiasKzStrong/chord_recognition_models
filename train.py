@@ -12,7 +12,7 @@ from torch.utils.data import DistributedSampler
 from tqdm.auto import tqdm
 
 from dataset import *
-from model import *
+from models import HyperParameters, build_model
 
 
 def is_distributed() -> bool:
@@ -828,18 +828,22 @@ def format_worst_classes(per_class_acc: Dict[str, float], limit: int = 6) -> str
 
 
 def print_paper_comparison(result: Dict[str, object]) -> None:
+    model_name = str(result.get("model_type", "model")).upper()
     if result["label_mode"] in {"full_chord", "structured_full_chord"}:
-        model_label = "HTv2 structured" if result["label_mode"] == "structured_full_chord" else "HTv2 flat"
+        model_label = (
+            f"{model_name} structured"
+            if result["label_mode"] == "structured_full_chord"
+            else f"{model_name} flat"
+        )
         print(
-            "Paper-style large-vocabulary metrics | "
+            "Large-vocabulary metrics | "
             f"{model_label} accframe={result['test_accframe']:.4f} | "
             f"{model_label} accclass={result['test_accclass']:.4f} | "
-            f"accclass_seen={result['test_accclass_seen']:.4f} | "
             f"vocab={result['vocab_size']} | "
             f"seen_test_classes={result['test_seen_chord_classes']}"
         )
         print(
-            "Paper-style structural metric proxies | "
+            "Structural metric proxies | "
             f"Root={result['test_paper_root']:.4f} | "
             f"Thirds={result['test_paper_thirds']:.4f} | "
             f"MajMin={result['test_paper_majmin']:.4f} | "
@@ -849,24 +853,19 @@ def print_paper_comparison(result: Dict[str, object]) -> None:
             f"MIREX_proxy_exact={result['test_accframe']:.4f}"
         )
         print(
-            "ChordFormer Table II reference: Root=0.8469 Thirds=0.8175 MajMin=0.8409 "
-            "Triads=0.7755 Sevenths=0.7228 Tetrads=0.6532 MIREX=0.8362"
+            "Reference note: official Root/MIREX-style scores should be computed with mir_eval "
+            "from aligned chord intervals."
         )
         print(
-            "ChordFormer Table III no-reweight reference: accframe=0.7877 accclass=0.3884 | "
-            "CNN+BLSTM: accframe=0.7676 accclass=0.3315"
-        )
-        print(
-            "Note: structural metrics here are lightweight proxies. Official Root/MIREX-style "
-            "scores should be computed with mir_eval from aligned chord intervals. "
+            "Note: structural metrics here are lightweight proxies. "
             "structured_full_chord uses six component heads and legal-vocabulary decoding, "
             "but does not include the paper's CRF temporal decoder."
         )
     else:
         print(
             "Quality27 metrics | "
-            f"HTv2 frame_acc={result['test_accframe']:.4f} | "
-            f"HTv2 macro_quality_acc={result['test_accclass_seen']:.4f} | "
+            f"{model_name} frame_acc={result['test_accframe']:.4f} | "
+            f"{model_name} macro_quality_acc={result['test_accclass_seen']:.4f} | "
             f"vocab={result['vocab_size']}"
         )
         print(
@@ -950,25 +949,13 @@ def run_one_fold(
         n_heads=args.n_heads,
     )
 
-    if args.label_mode == "structured_full_chord":
-        component_sizes = {
-            name: len(vocab.component_labels[name])
-            for name in vocab.component_names
-        }
-        model = StructuredHTv2ChordModel(
-            input_dim=input_dim,
-            component_sizes=component_sizes,
-            chord_component_ids=vocab.chord_component_ids,
-            hyperparameters=hp,
-            dropout_rate=args.dropout,
-        ).to(device)
-    else:
-        model = HTv2ChordModel(
-            input_dim=input_dim,
-            n_chords=n_chords,
-            hyperparameters=hp,
-            dropout_rate=args.dropout,
-        ).to(device)
+    model = build_model(
+        model_type=args.model_type,
+        input_dim=input_dim,
+        vocab=vocab,
+        hyperparameters=hp,
+        dropout_rate=args.dropout,
+    ).to(device)
 
     if is_distributed():
         if device.type == "cuda":
@@ -1103,6 +1090,7 @@ def run_one_fold(
 
     result = {
         "fold_file": os.path.basename(fold_json_path),
+        "model_type": args.model_type,
         "label_mode": args.label_mode,
         "best_val_score": best_val_score,
         "best_val_loss": best_val_loss,
@@ -1113,12 +1101,9 @@ def run_one_fold(
         "test_macro_chord_acc": test_metrics["macro_chord_acc"],
         "test_macro_chord_acc_all": test_metrics["macro_chord_acc_all"],
         "test_accframe": test_metrics["chord_acc"],
-        "test_accclass": (
-            test_metrics["macro_chord_acc_all"]
-            if args.label_mode in {"full_chord", "structured_full_chord"}
-            else test_metrics["macro_chord_acc"]
-        ),
+        "test_accclass": test_metrics["macro_chord_acc"],
         "test_accclass_seen": test_metrics["macro_chord_acc"],
+        "test_accclass_all": test_metrics["macro_chord_acc_all"],
         "test_seen_chord_classes": test_metrics["seen_chord_classes"],
         "test_structured_decode": args.label_mode == "structured_full_chord",
         "test_paper_root": test_metrics["paper_root"],
@@ -1247,10 +1232,9 @@ def run_cross_validation(root_dir, device, args):
             print(f"{label:<27}= {values.mean():.4f} ± {values.std():.4f}")
     if args.paper_compare and full_chord_results:
         print("-" * 80)
-        print("ChordFormer Table III no-reweight reference: accframe=0.7877, accclass=0.3884")
-        print("CNN+BLSTM Table III no-reweight reference: accframe=0.7676, accclass=0.3315")
+        print("accclass is reported over seen classes only, matching the notebook scorer.")
     elif args.paper_compare:
         print("-" * 80)
-        print("Quality27 run: Table II/Table III comparison requires --label_mode structured_full_chord.")
+        print("Quality27 run: large-vocabulary comparison requires --label_mode structured_full_chord.")
 
     return all_results

@@ -67,7 +67,7 @@ def get_args():
     parser.add_argument('--fold_ids', type=str, default="",
                         help="Comma-separated fold ids, e.g. '0' or '0,1'. Overrides --num_folds.")
     parser.add_argument('--paper_compare', action="store_true",
-                        help="Print ChordFormer-style accframe/accclass aliases and paper reference numbers.")
+                        help="Print large-vocabulary accframe/accclass aliases and reference numbers.")
     parser.add_argument('--root_dir', type=str, default=None)
     return parser.parse_args()
 
